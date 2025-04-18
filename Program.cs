@@ -31,6 +31,21 @@ builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connect
 builder.Services.AddEndpointsApiExplorer(); // Needed by Swagger
 builder.Services.AddSwaggerGen();          // Configures Swagger generation
 
+// *** ADD CORS Policy ***
+var MyAllowSpecificOrigins = "_myAllowSpecificOrigins"; // Define a policy name
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(name: MyAllowSpecificOrigins,
+                      policy  =>
+                      {
+                          policy.WithOrigins("https://Tanner253.github.io") // Allow your GitHub Pages origin
+                                .AllowAnyHeader() // Allow common headers like Content-Type, Authorization
+                                .AllowAnyMethod(); // Allow GET, POST, PUT, DELETE etc.
+                          // Consider policy.AllowCredentials() if you need cookies/auth headers with CORS
+                      });
+});
+// ************************
 
 var app = builder.Build();
 
@@ -44,6 +59,13 @@ if (app.Environment.IsDevelopment())
 
 // Comment out HTTPS redirection for local HTTP testing
 // app.UseHttpsRedirection();
+
+app.UseRouting(); // Ensure UseRouting is called before UseCors
+
+// *** USE CORS Policy ***
+// IMPORTANT: Add UseCors BEFORE UseAuthorization and MapControllers
+app.UseCors(MyAllowSpecificOrigins);
+// ***********************
 
 app.UseAuthorization();
 
