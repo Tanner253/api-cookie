@@ -23,8 +23,6 @@ namespace Api.Data.Models
 
         public DateTime LastLoginAt { get; set; } = DateTime.UtcNow;
 
-        public string? FirebaseId { get; set; } // Consider if this duplicates FirebaseUid
-
         // Navigation properties
         public virtual PlayerChatInfo? PlayerChatInfo { get; set; }
         public virtual PlayerSettings? PlayerSettings { get; set; }

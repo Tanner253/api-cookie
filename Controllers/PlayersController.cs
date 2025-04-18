@@ -17,66 +17,113 @@ namespace Api.Controllers
             _context = context;
         }
 
-        // DTO for the FindByDevice request body (Moved from PlayerController)
-        public class FindByDeviceRequest
+        // --- DTOs for Controller Actions ---
+        public class IdentifyPlayerRequestDto
         {
             public required string DeviceId { get; set; }
+            public required string FirebaseUid { get; set; }
         }
 
-        // POST /api/players/findByDevice (Moved from PlayerController)
-        [HttpPost("findByDevice")]
-        public async Task<ActionResult<Player>> FindByDevice([FromBody] FindByDeviceRequest request)
+        public class UpdateUsernameRequestDto // Kept from original code
         {
-            if (string.IsNullOrEmpty(request.DeviceId))
+            public required string ChatUsername { get; set; }
+        }
+
+        // --- Player Identification and Basic CRUD --- 
+
+        // POST /api/players/identify
+        [HttpPost("identify")]
+        public async Task<ActionResult<PlayerDto>> IdentifyPlayer([FromBody] IdentifyPlayerRequestDto request)
+        {
+            if (string.IsNullOrEmpty(request.DeviceId) || string.IsNullOrEmpty(request.FirebaseUid))
             {
-                return BadRequest("DeviceId cannot be empty.");
+                return BadRequest("DeviceId and FirebaseUid cannot be empty.");
             }
 
-            // Try to find an existing player by DeviceId
-            // Consider including essential related data needed immediately after login/identification
-            var player = await _context.Players
-                .FirstOrDefaultAsync(p => p.DeviceId == request.DeviceId);
+            Player? player = null;
+            bool createdNewPlayer = false;
+
+            // 1. Try to find by FirebaseUid
+            player = await _context.Players
+                .FirstOrDefaultAsync(p => p.FirebaseUid == request.FirebaseUid);
 
             if (player != null)
             {
-                // Player found, update LastLoginAt and return
-                player.LastLoginAt = DateTime.UtcNow;
-                await _context.SaveChangesAsync();
-                // Return the basic player object for now. GameState will be fetched separately.
-                return Ok(player); 
+                // Player found by FirebaseUid. Update DeviceId if it has changed.
+                if (player.DeviceId != request.DeviceId)
+                {
+                    player.DeviceId = request.DeviceId;
+                }
             }
             else
             {
-                // Player not found, create a new one
-                 // ---> ENHANCEMENT: Create associated default entities (State, Settings, ChatInfo, AgeVerification) here! <---
-                var newPlayer = new Player
+                // 2. Not found by FirebaseUid, try by DeviceId
+                player = await _context.Players
+                    .FirstOrDefaultAsync(p => p.DeviceId == request.DeviceId);
+
+                if (player != null)
                 {
-                    DeviceId = request.DeviceId,
-                    FirebaseUid = string.Empty, 
-                    CreatedAt = DateTime.UtcNow,
-                    LastLoginAt = DateTime.UtcNow,
-                    // Initialize required related entities with default values
-                    PlayerState = new PlayerState(),
-                    PlayerSettings = new PlayerSettings(),
-                    PlayerChatInfo = new PlayerChatInfo { ChatUsername = null, UpdatedAt = DateTime.UtcNow }, // Add default ChatInfo
-                    PlayerAgeVerification = new PlayerAgeVerification { AgeVerificationStatusId = 1, VerificationAttemptCount = 0 } // Add default AgeVerification (linking to Status ID 1: Not Verified)
-                };
+                    // Player found by DeviceId. Link FirebaseUid to this player.
+                    player.FirebaseUid = request.FirebaseUid;
+                }
+                else
+                {
+                    // 3. Not found by either ID, create a new player
+                    player = new Player
+                    {
+                        DeviceId = request.DeviceId,
+                        FirebaseUid = request.FirebaseUid,
+                        CreatedAt = DateTime.UtcNow,
+                        LastLoginAt = DateTime.UtcNow,
+                        // Initialize required related entities with default values
+                        PlayerState = new PlayerState(),
+                        PlayerSettings = new PlayerSettings(),
+                        PlayerChatInfo = new PlayerChatInfo { ChatUsername = null, UpdatedAt = DateTime.UtcNow },
+                        PlayerAgeVerification = new PlayerAgeVerification { AgeVerificationStatusId = 1, VerificationAttemptCount = 0 }
+                    };
+                    _context.Players.Add(player);
+                    createdNewPlayer = true;
+                }
+            }
 
-                _context.Players.Add(newPlayer);
+            // Update LastLoginAt for existing or newly created player
+            player.LastLoginAt = DateTime.UtcNow;
+
+            try
+            {
                 await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateException ex) // Catch potential unique constraint violations
+            {
+                 // Log the error (ex)
+                 Console.WriteLine($"Error saving player identification: {ex.InnerException?.Message ?? ex.Message}");
+                 // Check if it's a unique constraint violation (e.g., duplicate FirebaseUid or DeviceId assigned elsewhere)
+                 // You might need database-specific checks here (e.g., check exception number for SQL Server or PostgreSQL)
+                 // For simplicity, return a generic conflict or server error
+                 return Conflict("A conflict occurred while trying to save player data. The FirebaseUid or DeviceId might already be associated with another player.");
+            }
 
-                // Return 201 Created with the new player data (including the generated ID)
-                return CreatedAtAction(nameof(GetPlayerById), new { id = newPlayer.PlayerId }, newPlayer);
+            // Map to DTO
+            var playerDto = MapPlayerToDto(player);
+
+            if (createdNewPlayer)
+            {
+                // Return 201 Created with the DTO
+                return CreatedAtAction(nameof(GetPlayerById), new { id = player.PlayerId }, playerDto);
+            }
+            else
+            {
+                // Return 200 OK with the DTO
+                return Ok(playerDto);
             }
         }
 
-
         // GET: api/players/{id}
-        [HttpGet("{id}")]
-        public async Task<ActionResult<Player>> GetPlayerById(long id)
+        [HttpGet("{id:long}")]
+        public async Task<ActionResult<PlayerDto>> GetPlayerById(long id)
         {
-            // Basic fetch, GameState fetch will be separate
             var player = await _context.Players
+                                     .AsNoTracking() // Use NoTracking for read-only operation
                                      .FirstOrDefaultAsync(p => p.PlayerId == id);
 
             if (player == null)
@@ -84,112 +131,49 @@ namespace Api.Controllers
                 return NotFound($"Player {id} not found");
             }
 
-            // Return just the player object. Client should call GetGameState if needed.
-            return Ok(player);
+            return Ok(MapPlayerToDto(player)); // Return DTO
         }
 
-
-        //POST - CREATE api/players
-        // TODO: This is a basic implementation. Creating a player likely requires
-        // ... existing comments ...
-        // NOTE: This endpoint might become less relevant if FindByDevice handles creation.
-        [HttpPost]
-        public async Task<ActionResult<Player>> CreatePlayer([FromBody] Player newPlayer) // Input type changed
+        // GET: api/players/findByFirebaseUid/{firebaseUid}
+        [HttpGet("findByFirebaseUid/{firebaseUid}")]
+        public async Task<ActionResult<PlayerDto>> FindByFirebaseUid(string firebaseUid)
         {
-            if (newPlayer == null)
+            if (string.IsNullOrEmpty(firebaseUid))
             {
-                return BadRequest("Player data is null");
+                return BadRequest("Firebase UID cannot be empty.");
             }
 
-            // Basic validation example - Ensure required fields are present
-            if (string.IsNullOrEmpty(newPlayer.FirebaseUid))
+            var player = await _context.Players
+                                     .AsNoTracking()
+                                     .Where(p => p.FirebaseUid == firebaseUid)
+                                     .FirstOrDefaultAsync();
+
+            if (player == null)
             {
-                 return BadRequest("FirebaseUid is required.");
+                return NotFound($"Player not found with Firebase UID: {firebaseUid}");
             }
 
-            // Check if FirebaseUid already exists (assuming it must be unique)
-            if (await _context.Players.AnyAsync(p => p.FirebaseUid == newPlayer.FirebaseUid))
-            {
-                 return Conflict($"Player with FirebaseUid {newPlayer.FirebaseUid} already exists.");
-            }
-
-            // Set default timestamps (though model defaults might handle this)
-            newPlayer.CreatedAt = DateTime.UtcNow;
-            newPlayer.LastLoginAt = DateTime.UtcNow;
-
-            // >>> Enhancement Needed <<< 
-            // Ensure associated entities are created here too, similar to FindByDevice
-            if(newPlayer.PlayerState == null) newPlayer.PlayerState = new PlayerState();
-            if(newPlayer.PlayerSettings == null) newPlayer.PlayerSettings = new PlayerSettings();
-            // ... etc ...
-
-            _context.Players.Add(newPlayer); // Use Players DbSet
-
-            await _context.SaveChangesAsync();
-
-            // Return 201 Created, referencing the GetPlayerById action
-            return CreatedAtAction(nameof(GetPlayerById), new { id = newPlayer.PlayerId }, newPlayer);
+            return Ok(MapPlayerToDto(player)); // Return DTO
         }
 
-
-        //PUT - UPDATE api/players/{id}
-        // TODO: This is a basic implementation. Updating related entities (PlayerState, etc.)
-        // ... existing comments ...
-        // NOTE: This endpoint is likely superseded by the PUT GameState endpoint.
-        [HttpPut("{id}")]
-        public async Task<ActionResult> UpdatePlayer(long id, [FromBody] Player playerUpdateData) // id is long, input is Player
+        // Helper to map Player entity to PlayerDto
+        private PlayerDto MapPlayerToDto(Player player)
         {
-            if (playerUpdateData == null)
+            return new PlayerDto
             {
-                return BadRequest("Player data is null");
-            }
-
-            // Ignore PlayerId from body, use the one from the route
-            // if (playerUpdateData.PlayerId != 0 && playerUpdateData.PlayerId != id)
-            // {
-            //     return BadRequest("Player ID mismatch in body vs route.");
-            // }
-
-            var existingPlayer = await _context.Players.FindAsync(id); // Find Player by long id
-            if (existingPlayer == null)
-            {
-                return NotFound($"Player not found with ID {id}");
-            }
-
-            // Update only allowed fields from playerUpdateData
-            // Example: Updating ChatDeviceId. Add other updatable Player fields as needed.
-            if (playerUpdateData.ChatDeviceId != null)
-            {
-                existingPlayer.ChatDeviceId = playerUpdateData.ChatDeviceId;
-            }
-            // existingPlayer.FirebaseId = playerUpdateData.FirebaseId; // If FirebaseId is updatable
-
-            // DO NOT update related entities here unless intended and handled carefully.
-            // Updates to PlayerState, PlayerSettings etc. should have their own endpoints/logic.
-            // existingPlayer.PlayerState.CurrentScore = playerUpdateData.PlayerState.CurrentScore; // <-- Avoid this pattern here
-
-            try
-            {
-                await _context.SaveChangesAsync();
-            }
-            catch (DbUpdateConcurrencyException)
-            {
-                if (!await PlayerExists(id))
-                {
-                    return NotFound($"Player {id} not found during save.");
-                }
-                else
-                {
-                    throw;
-                }
-            }
-            return NoContent(); // Return 204 No Content on successful update
+                PlayerId = player.PlayerId,
+                FirebaseUid = player.FirebaseUid,
+                DeviceId = player.DeviceId,
+                ChatDeviceId = player.ChatDeviceId,
+                CreatedAt = player.CreatedAt,
+                LastLoginAt = player.LastLoginAt
+            };
         }
 
         // Helper method updated for Player
         private async Task<bool> PlayerExists(long id) // id is long
         {
-            return await _context.Players.AnyAsync(e => e.PlayerId == id); // Check Players DbSet
+            return await _context.Players.AnyAsync(e => e.PlayerId == id);
         }
 
         // --- Game State Endpoints --- 

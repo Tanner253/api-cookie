@@ -1,9 +1,12 @@
+#nullable enable // Enable nullable context for this file
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 
 namespace Api.Data.Dtos
 {
+    // NOTE: Removed duplicate PlayerDto definition from here. It now resides in Data/Dtos/PlayerDto.cs
+
     // --- DTOs for Game State ---
 
     public class PlayerSettingsDto
