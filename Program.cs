@@ -9,7 +9,12 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.
 
-builder.Services.AddControllers();
+// Configure JSON options to handle cycles
+builder.Services.AddControllers().AddJsonOptions(options =>
+{
+    options.JsonSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;
+});
+
 builder.Services.AddOpenApi();
 
 /// <summary>
@@ -37,7 +42,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();    // Serves the interactive Swagger UI HTML page
 }
 
-app.UseHttpsRedirection();
+// Comment out HTTPS redirection for local HTTP testing
+// app.UseHttpsRedirection();
 
 app.UseAuthorization();
 
