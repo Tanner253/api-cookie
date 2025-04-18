@@ -63,9 +63,10 @@ This repository contains the backend API server for the Cookie Clicker Unity gam
 
 *(This section assumes ERD images exist in a `/readmeassets` folder relative to the README)*
 
-![Player Related Tables](./readmeassets/erd-players.png)
-![Upgrades Related Tables](./readmeassets/erd-upgrades.png)
-
+![erd](./readmeassets/erd.jpg)
+![erd](./readmeassets/erd1.jpg)
+![erd](./readmeassets/erd2.jpg)
+![erd](./readmeassets/erdpgadmin.png)
 *(Add more ERD snippets as needed)*
 
 ## Contribution
