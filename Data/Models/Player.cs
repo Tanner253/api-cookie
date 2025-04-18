@@ -16,6 +16,9 @@ namespace Api.Data.Models
 
         public string? ChatDeviceId { get; set; }
 
+        [Required]
+        public string DeviceId { get; set; } = string.Empty;
+
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 
         public DateTime LastLoginAt { get; set; } = DateTime.UtcNow;
