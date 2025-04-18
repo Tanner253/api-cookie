@@ -49,6 +49,15 @@ namespace Api.Data.Dtos
         // public DateTime? VerifiedAtTimestamp { get; set; }
     }
 
+    // --- DTO for Updating Username --- 
+
+    public class UpdateUsernameRequestDto
+    {
+        [Required]
+        [StringLength(20, MinimumLength = 1)] // Match potential validation
+        public string? ChatUsername { get; set; }
+    }
+
     // --- Main Game State DTO ---
 
     public class GameStateDto

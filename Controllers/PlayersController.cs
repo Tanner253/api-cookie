@@ -452,5 +452,185 @@ namespace Api.Controllers
             // Simple endpoint to check if the API is responding
             return Ok("Pong!");
         }
+
+        // --- Specific Update Endpoints --- 
+
+        // PUT: api/players/{playerId}/chatInfo
+        [HttpPut("{playerId:long}/chatInfo")]
+        public async Task<IActionResult> UpdateChatInfo(long playerId, [FromBody] UpdateUsernameRequestDto requestDto)
+        {
+            if (requestDto == null || string.IsNullOrWhiteSpace(requestDto.ChatUsername))
+            {
+                 return BadRequest("Invalid username data provided.");
+            }
+            
+            // Find the player and their chat info
+            var playerChatInfo = await _context.PlayerChatInfos
+                                         .FirstOrDefaultAsync(pci => pci.PlayerId == playerId);
+
+            if (playerChatInfo == null)
+            {
+                 // This might happen if the player record exists but the relation wasn't created? Unlikely with current setup.
+                 // Or, the player simply doesn't exist.
+                 if (!await PlayerExists(playerId)){
+                     return NotFound($"Player {playerId} not found.");
+                 } else {
+                     // Player exists but info doesn't - potentially create it?
+                     // For now, return error. Could create it if needed.
+                     return StatusCode(500, $"Player chat info record not found for player {playerId}.");
+                 }
+            }
+
+            // Validate length etc. again server-side? (DTO attributes handle basic validation)
+            string validatedUsername = requestDto.ChatUsername.Trim();
+            if (validatedUsername.Length > 20) validatedUsername = validatedUsername.Substring(0, 20);
+            if (string.IsNullOrEmpty(validatedUsername)) return BadRequest("Username cannot be empty after trimming.");
+
+            // Update and save
+            playerChatInfo.ChatUsername = validatedUsername;
+            playerChatInfo.UpdatedAt = DateTime.UtcNow;
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (DbUpdateConcurrencyException) // Handle potential race conditions
+            {
+                 if (!await PlayerExists(playerId)) return NotFound();
+                 else throw;
+            }
+            catch(Exception ex) {
+                 Console.WriteLine($"ERROR updating chat info for player {playerId}: {ex.Message}");
+                 return StatusCode(500, "An error occurred updating username.");
+            }
+
+            return NoContent(); // Success (204)
+        }
+
+        // POST: api/players/{playerId}/verifyAge
+        [HttpPost("{playerId:long}/verifyAge")]
+        public async Task<IActionResult> VerifyPlayerAge(long playerId)
+        {
+            // Find the player's age verification record
+            var playerAgeVerification = await _context.PlayerAgeVerifications
+                                                .FirstOrDefaultAsync(pav => pav.PlayerId == playerId);
+
+            if (playerAgeVerification == null)
+            {
+                if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found.");
+                else return StatusCode(500, $"Player age verification record not found for player {playerId}.");
+            }
+
+            // Find the ID for the "Verified" status (assuming it exists from seeding)
+            long verifiedStatusId = await _context.AgeVerificationStatuses
+                                            .Where(s => s.Status == "Verified")
+                                            .Select(s => s.Id)
+                                            .FirstOrDefaultAsync();
+
+            if (verifiedStatusId == 0) {
+                // This indicates a seeding issue or data problem
+                Console.WriteLine($"ERROR verifying age for player {playerId}: 'Verified' status not found in DB.");
+                return StatusCode(500, "Server configuration error: Cannot find 'Verified' status.");
+            }
+
+            // Update the player's verification status
+            playerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
+            playerAgeVerification.VerifiedAt = DateTime.UtcNow;
+            // Optionally update VerificationMethod or AttemptCount if needed
+
+            try
+            {
+                await _context.SaveChangesAsync();
+            }
+            catch (Exception ex)
+            {
+                 Console.WriteLine($"ERROR saving age verification for player {playerId}: {ex.Message}");
+                 return StatusCode(500, "An error occurred saving age verification.");
+            }
+
+            return Ok(); // Return 200 OK to indicate success
+        }
+
+        // --- Mute List Endpoints ---
+
+        // GET: api/players/{playerId}/muted
+        [HttpGet("{playerId:long}/muted")]
+        public async Task<ActionResult<List<long>>> GetMutedPlayers(long playerId)
+        {
+            if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found.");
+
+            // Find players MUTED BY the specified playerId
+            var mutedIds = await _context.MutedPlayers
+                                     .Where(mp => mp.MuterPlayerId == playerId)
+                                     .Select(mp => mp.MutedPlayerId) // Select only the ID of the muted player
+                                     .ToListAsync();
+            
+            return Ok(mutedIds);
+        }
+
+        // POST: api/players/{muterPlayerId}/muted/{targetPlayerId}
+        [HttpPost("{muterPlayerId:long}/muted/{targetPlayerId:long}")]
+        public async Task<IActionResult> MutePlayer(long muterPlayerId, long targetPlayerId)
+        {
+            if (muterPlayerId == targetPlayerId) return BadRequest("Cannot mute yourself.");
+            
+            // Ensure both players exist
+            if (!await PlayerExists(muterPlayerId)) return NotFound($"Muting player {muterPlayerId} not found.");
+            if (!await PlayerExists(targetPlayerId)) return NotFound($"Target player {targetPlayerId} not found.");
+
+            // Check if already muted
+            bool alreadyMuted = await _context.MutedPlayers
+                                        .AnyAsync(mp => mp.MuterPlayerId == muterPlayerId && mp.MutedPlayerId == targetPlayerId);
+
+            if (alreadyMuted)
+            {
+                return Conflict("Player already muted."); // Or return Ok() if idempotent is preferred
+            }
+
+            // Create and add the mute record
+            var muteRecord = new MutedPlayer
+            {
+                MuterPlayerId = muterPlayerId,
+                MutedPlayerId = targetPlayerId,
+                MutedAt = DateTime.UtcNow
+                // Duration could be added here if needed
+            };
+            _context.MutedPlayers.Add(muteRecord);
+
+            try {
+                await _context.SaveChangesAsync();
+                return Ok(); // Return 200 OK on successful mute
+            }
+            catch (Exception ex) {
+                Console.WriteLine($"ERROR muting player {targetPlayerId} by {muterPlayerId}: {ex.Message}");
+                return StatusCode(500, "An error occurred while muting player.");
+            }
+        }
+
+        // DELETE: api/players/{muterPlayerId}/muted/{targetPlayerId}
+        [HttpDelete("{muterPlayerId:long}/muted/{targetPlayerId:long}")]
+        public async Task<IActionResult> UnmutePlayer(long muterPlayerId, long targetPlayerId)
+        {
+            // Find the mute record
+            var muteRecord = await _context.MutedPlayers
+                                       .FirstOrDefaultAsync(mp => mp.MuterPlayerId == muterPlayerId && mp.MutedPlayerId == targetPlayerId);
+
+            if (muteRecord == null)
+            {
+                return NotFound("Mute record not found.");
+            }
+
+            _context.MutedPlayers.Remove(muteRecord);
+
+             try {
+                await _context.SaveChangesAsync();
+                return NoContent(); // Return 204 No Content on successful unmute
+            }
+            catch (Exception ex) {
+                Console.WriteLine($"ERROR unmuting player {targetPlayerId} by {muterPlayerId}: {ex.Message}");
+                return StatusCode(500, "An error occurred while unmuting player.");
+            }
+        }
+
     }
 }
