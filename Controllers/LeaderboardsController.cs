@@ -40,9 +40,9 @@ namespace Api.Controllers
                     .Select(p => new
                     {
                         PlayerId = p.PlayerId,
-                        Username = p.PlayerChatInfo.ChatUsername,
-                        TotalScoreString = p.PlayerState.TotalLifeTimeScoreEarned ?? "0", // Use ?? "0" for safety
-                        PrestigeCount = p.PlayerState.PrestigeCount
+                        Username = p.PlayerChatInfo!.ChatUsername,
+                        TotalScoreString = p.PlayerState!.TotalLifeTimeScoreEarned ?? "0",
+                        PrestigeCount = p.PlayerState!.PrestigeCount
                     })
                     .ToListAsync(); // Bring data into memory
 

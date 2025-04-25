@@ -156,6 +156,34 @@ namespace Api.Controllers
             return Ok(MapPlayerToDto(player)); // Return DTO
         }
 
+        // POST: api/players/findByDevice
+        [HttpPost("findByDevice")]
+        public async Task<ActionResult<PlayerDto>> FindByDevice([FromBody] DeviceIdRequest request)
+        {
+            if (string.IsNullOrEmpty(request.deviceId))
+            {
+                return BadRequest("Device ID cannot be empty.");
+            }
+
+            var player = await _context.Players
+                                     .AsNoTracking()
+                                     .Where(p => p.DeviceId == request.deviceId)
+                                     .FirstOrDefaultAsync();
+
+            if (player == null)
+            {
+                return NotFound($"Player not found with Device ID: {request.deviceId}");
+            }
+
+            return Ok(MapPlayerToDto(player));
+        }
+
+        // Add the Request DTO class for FindByDevice endpoint
+        public class DeviceIdRequest
+        {
+            public string deviceId { get; set; } = string.Empty;
+        }
+
         // Helper to map Player entity to PlayerDto
         private PlayerDto MapPlayerToDto(Player player)
         {
@@ -233,7 +261,10 @@ namespace Api.Controllers
                 },
                 PlayerAgeVerification = new PlayerAgeVerificationDto
                 {
-                    IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified" 
+                    // Explicitly check each part, add null-forgiving (!) to satisfy compiler
+                    IsVerified = player.PlayerAgeVerification != null && 
+                                 player.PlayerAgeVerification.AgeVerificationStatus != null &&
+                                 player.PlayerAgeVerification.AgeVerificationStatus!.Status == "Verified"
                 },
                 PlayerUpgrades = player.PlayerUpgrades.Select(pu => new PlayerUpgradeDto
                 {
@@ -300,9 +331,10 @@ namespace Api.Controllers
             player.PlayerSettings.UpdatedAt = DateTime.UtcNow;
 
             // --- Update PlayerChatInfo ---
-            var chatInfoDto = gameStateDto.PlayerChatInfo;
-            player.PlayerChatInfo.ChatUsername = chatInfoDto.ChatUsername;
-            player.PlayerChatInfo.UpdatedAt = DateTime.UtcNow;
+            // REMOVED: Username update is now handled by a dedicated API call
+            // var chatInfoDto = gameStateDto.PlayerChatInfo;
+            // player.PlayerChatInfo.ChatUsername = chatInfoDto.ChatUsername;
+            // player.PlayerChatInfo.UpdatedAt = DateTime.UtcNow;
 
             // --- Update PlayerAgeVerification ---
             // This might require more complex logic. 
@@ -367,6 +399,12 @@ namespace Api.Controllers
 
             // Update Player's LastLoginAt
             player.LastLoginAt = DateTime.UtcNow;
+
+            // Explicitly detach PlayerChatInfo to prevent implicit updates during the final save
+            if (player.PlayerChatInfo != null) // Add null check for safety
+            {
+                 _context.Entry(player.PlayerChatInfo).State = EntityState.Detached;
+            }
 
             try
             {
