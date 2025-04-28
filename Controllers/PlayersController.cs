@@ -4,6 +4,15 @@ using Api.Data.Context;
 using Api.Data.Models;
 using System.Threading.Tasks; // Ensure this is present
 using Api.Data.Dtos; // Add this using statement for DTOs
+using Microsoft.Extensions.Configuration; // Added for IConfiguration
+using Microsoft.Extensions.Logging; // Added for ILogger
+using Microsoft.IdentityModel.Tokens; // Added for JWT
+using System.IdentityModel.Tokens.Jwt; // Added for JWT
+using System.Security.Claims; // Added for JWT
+using System.Text; // Added for JWT
+using Microsoft.AspNetCore.Authorization; // Added for [Authorize]
+using System.Security.Cryptography; // Added for Refresh Token generation
+using System.Security.Claims; // Added for ClaimTypes
 
 namespace Api.Controllers
 {
@@ -12,9 +21,15 @@ namespace Api.Controllers
     public class PlayersController : ControllerBase
     {
         private readonly AppDbContext _context;
-        public PlayersController(AppDbContext context)
+        private readonly IConfiguration _configuration; // Added
+        private readonly ILogger<PlayersController> _logger; // Added for ILogger
+
+        // Inject IConfiguration and ILogger
+        public PlayersController(AppDbContext context, IConfiguration configuration, ILogger<PlayersController> logger)
         {
             _context = context;
+            _configuration = configuration; // Added
+            _logger = logger; // Added
         }
 
         // --- DTOs for Controller Actions ---
@@ -22,6 +37,24 @@ namespace Api.Controllers
         {
             public required string DeviceId { get; set; }
             public required string FirebaseUid { get; set; }
+        }
+
+        // DTO to include the ACCESS token in the response
+        // Refresh token will be sent via HttpOnly Cookie
+        public class IdentifyPlayerResponseDto
+        {
+            public required PlayerDto Player { get; set; }
+            public required string AccessToken { get; set; }
+        }
+
+        public class RefreshTokenRequestDto
+        {
+            public string? ExpiredAccessToken { get; set; } // Optional: Send expired token for potential checks
+        }
+
+        public class RefreshTokenResponseDto
+        {
+            public required string AccessToken { get; set; }
         }
 
         public class UpdateUsernameRequestDto // Kept from original code
@@ -33,7 +66,7 @@ namespace Api.Controllers
 
         // POST /api/players/identify
         [HttpPost("identify")]
-        public async Task<ActionResult<PlayerDto>> IdentifyPlayer([FromBody] IdentifyPlayerRequestDto request)
+        public async Task<ActionResult<IdentifyPlayerResponseDto>> IdentifyPlayer([FromBody] IdentifyPlayerRequestDto request)
         {
             if (string.IsNullOrEmpty(request.DeviceId) || string.IsNullOrEmpty(request.FirebaseUid))
             {
@@ -89,39 +122,150 @@ namespace Api.Controllers
             // Update LastLoginAt for existing or newly created player
             player.LastLoginAt = DateTime.UtcNow;
 
+            // --- Generate Tokens and Save Refresh Token --- 
+            var accessToken = GenerateJwtToken(player);
+            var refreshToken = GenerateRefreshToken(); 
+
+            // Set refresh token details on the player entity
+            player.RefreshToken = refreshToken; // Store the actual token (or hash it)
+            player.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7); // Set expiry (e.g., 7 days)
+            // -------------------------------------------------
+
             try
             {
                 await _context.SaveChangesAsync();
             }
-            catch (DbUpdateException ex) // Catch potential unique constraint violations
+            catch (DbUpdateException ex)
             {
-                 // Log the error (ex)
-                 Console.WriteLine($"Error saving player identification: {ex.InnerException?.Message ?? ex.Message}");
-                 // Check if it's a unique constraint violation (e.g., duplicate FirebaseUid or DeviceId assigned elsewhere)
-                 // You might need database-specific checks here (e.g., check exception number for SQL Server or PostgreSQL)
-                 // For simplicity, return a generic conflict or server error
-                 return Conflict("A conflict occurred while trying to save player data. The FirebaseUid or DeviceId might already be associated with another player.");
+                 Console.WriteLine($"Error saving player identify/refresh token: {ex.InnerException?.Message ?? ex.Message}");
+                 return Conflict("A conflict occurred while trying to save player data.");
             }
 
-            // Map to DTO
             var playerDto = MapPlayerToDto(player);
+
+            // --- Set Refresh Token in Secure, HttpOnly Cookie --- 
+            var cookieOptions = new CookieOptions
+            {
+                HttpOnly = true, // Prevents client-side script access
+                Expires = player.RefreshTokenExpiryTime, // Cookie expires with the token
+                // Secure = true, // Set to true if using HTTPS
+                // SameSite = SameSiteMode.Strict // Consider Strict or Lax for CSRF protection
+            };
+            Response.Cookies.Append("refreshToken", refreshToken, cookieOptions);
+            // -----------------------------------------------------
+
+            var responseDto = new IdentifyPlayerResponseDto
+            {
+                Player = playerDto,
+                AccessToken = accessToken // Only return the access token in the body
+            };
 
             if (createdNewPlayer)
             {
-                // Return 201 Created with the DTO
-                return CreatedAtAction(nameof(GetPlayerById), new { id = player.PlayerId }, playerDto);
+                return CreatedAtAction(nameof(GetPlayerById), new { id = player.PlayerId }, responseDto);
             }
             else
             {
-                // Return 200 OK with the DTO
-                return Ok(playerDto);
+                return Ok(responseDto);
+            }
+        }
+
+        // --- ADDED: Refresh Token Endpoint --- 
+        // POST /api/players/refresh
+        [HttpPost("refresh")]
+        public async Task<ActionResult<RefreshTokenResponseDto>> RefreshToken([FromBody] RefreshTokenRequestDto requestDto) // Added request DTO if needed
+        {
+            // 1. Get refresh token from HttpOnly cookie
+            var refreshToken = Request.Cookies["refreshToken"];
+            if (string.IsNullOrEmpty(refreshToken))
+            {
+                return Unauthorized("Refresh token not found.");
+            }
+
+            // 2. Find player by refresh token (assuming we store the plain token for simplicity)
+            //    NOTE: Storing a HASH of the refresh token is more secure.
+            var player = await _context.Players.FirstOrDefaultAsync(p => p.RefreshToken == refreshToken);
+
+            // 3. Validate token existence and expiry
+            if (player == null || player.RefreshTokenExpiryTime == null || player.RefreshTokenExpiryTime <= DateTime.UtcNow)
+            {
+                return Unauthorized("Invalid or expired refresh token.");
+            }
+
+            // 4. Generate a new access token
+            var newAccessToken = GenerateJwtToken(player);
+
+            // --- OPTIONAL: Refresh Token Rotation --- 
+            // Generate a new refresh token and update expiry
+            // var newRefreshToken = GenerateRefreshToken();
+            // player.RefreshToken = newRefreshToken;
+            // player.RefreshTokenExpiryTime = DateTime.UtcNow.AddDays(7); // Reset expiry
+            // await _context.SaveChangesAsync(); // Save the new refresh token
+            // // Set the new refresh token in the cookie
+            // var cookieOptions = new CookieOptions { HttpOnly = true, Expires = player.RefreshTokenExpiryTime };
+            // Response.Cookies.Append("refreshToken", newRefreshToken, cookieOptions);
+            // --- End Optional Rotation ---
+
+            // 5. Return the new access token
+            return Ok(new RefreshTokenResponseDto { AccessToken = newAccessToken });
+        }
+        // ---------------------------------------
+
+        // Helper method to generate JWT token (Access Token)
+        private string GenerateJwtToken(Player player)
+        {
+            var jwtSettings = _configuration.GetSection("Jwt");
+            var secretKey = jwtSettings["SecretKey"];
+            if (string.IsNullOrEmpty(secretKey)) {
+                throw new InvalidOperationException("JWT Secret Key not configured.");
+            }
+
+            var securityKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
+            var credentials = new SigningCredentials(securityKey, SecurityAlgorithms.HmacSha256);
+
+            // Create claims (information about the user)
+            var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, player.PlayerId.ToString()), // Subject = Player ID
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()), // Unique Token ID
+                new Claim("FirebaseUid", player.FirebaseUid ?? string.Empty), // Custom claim for Firebase UID
+                // Add other claims as needed (e.g., roles)
+            };
+
+            // Define token details
+            var token = new JwtSecurityToken(
+                issuer: jwtSettings["Issuer"],
+                audience: jwtSettings["Audience"],
+                claims: claims,
+                expires: DateTime.UtcNow.AddHours(12), // CHANGED: 12 Hour Expiry 
+                signingCredentials: credentials);
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
+        }
+
+        // Helper method to generate a secure random string for Refresh Token
+        private string GenerateRefreshToken()
+        {
+            var randomNumber = new byte[64]; // Increased size for more entropy
+            using (var rng = RandomNumberGenerator.Create())
+            {
+                rng.GetBytes(randomNumber);
+                return Convert.ToBase64String(randomNumber);
             }
         }
 
         // GET: api/players/{id}
         [HttpGet("{id:long}")]
+        [Authorize] // Secure this endpoint
         public async Task<ActionResult<PlayerDto>> GetPlayerById(long id)
         {
+            // Optional: Check if the authenticated user (from token) matches the requested id
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != id.ToString()) {
+                // return Forbid(); // Or Unauthorized()
+            }
+            // End Optional Check
+
             var player = await _context.Players
                                      .AsNoTracking() // Use NoTracking for read-only operation
                                      .FirstOrDefaultAsync(p => p.PlayerId == id);
@@ -208,8 +352,21 @@ namespace Api.Controllers
 
         // GET: api/players/{playerId}/gameState
         [HttpGet("{playerId:long}/gameState")]
+        [Authorize] // Secure this endpoint
         public async Task<ActionResult<GameStateDto>> GetGameState(long playerId)
         {
+            // Validate requester matches player ID using ClaimTypes.NameIdentifier
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
+            // --- Add Logging ---
+            _logger.LogInformation($"GameState AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'");
+            // -----------------------------------
+            if (requestingPlayerId != playerId.ToString())
+            {
+                _logger.LogWarning($"GameState AuthCheck FAILED for PlayerId {playerId}. Token Sub was '{requestingPlayerId ?? "NULL"}'. Returning Forbid.");
+                return Forbid();
+            }
+            _logger.LogInformation($"GameState AuthCheck PASSED for PlayerId {playerId}.");
+
             // Fetch the player and all related data needed for the game state
             var player = await _context.Players
                 .Include(p => p.PlayerState)
@@ -288,8 +445,23 @@ namespace Api.Controllers
 
         // PUT: api/players/{playerId}/gameState
         [HttpPut("{playerId:long}/gameState")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> UpdateGameState(long playerId, [FromBody] GameStateDto gameStateDto)
         {
+            // Validate requester matches player ID
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); // This should now correctly get "3"
+            
+            // --- ADD DETAILED LOGGING FOR PUT --- 
+            _logger.LogInformation($"UpdateGameState AuthCheck: Comparing Token Sub='{requestingPlayerId ?? "NULL"}' with URL PlayerId='{playerId}' (as string: '{playerId.ToString()}')");
+            // ------------------------------------
+            
+            if (requestingPlayerId != playerId.ToString()) 
+            {
+                _logger.LogWarning($"UpdateGameState AuthCheck FAILED. Token Sub '{requestingPlayerId ?? "NULL"}' != URL PlayerId '{playerId}'. Returning Forbid.");
+                return Forbid(); // <<< This is the check causing the 403
+            }
+            _logger.LogInformation("UpdateGameState AuthCheck PASSED.");
+
             var player = await _context.Players
                 .Include(p => p.PlayerState)
                 .Include(p => p.PlayerSettings)
@@ -435,8 +607,13 @@ namespace Api.Controllers
 
         // DELETE: api/players/{playerId}
         [HttpDelete("{playerId:long}")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> DeletePlayer(long playerId)
         {
+            // Validate requester matches player ID
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != playerId.ToString()) return Forbid();
+
             // Find the player entity
             var player = await _context.Players.FindAsync(playerId);
 
@@ -479,8 +656,13 @@ namespace Api.Controllers
 
         // PUT: api/players/{playerId}/chatInfo
         [HttpPut("{playerId:long}/chatInfo")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> UpdateChatInfo(long playerId, [FromBody] UpdateUsernameRequestDto requestDto)
         {
+            // Validate requester matches player ID
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != playerId.ToString()) return Forbid();
+
             if (requestDto == null || string.IsNullOrWhiteSpace(requestDto.ChatUsername))
             {
                  return BadRequest("Invalid username data provided.");
@@ -531,8 +713,13 @@ namespace Api.Controllers
 
         // POST: api/players/{playerId}/verifyAge
         [HttpPost("{playerId:long}/verifyAge")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> VerifyPlayerAge(long playerId)
         {
+            // Validate requester matches player ID
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != playerId.ToString()) return Forbid();
+
             // Find the player's age verification record
             var playerAgeVerification = await _context.PlayerAgeVerifications
                                                 .FirstOrDefaultAsync(pav => pav.PlayerId == playerId);
@@ -577,8 +764,21 @@ namespace Api.Controllers
 
         // GET: api/players/{playerId}/muted
         [HttpGet("{playerId:long}/muted")]
+        [Authorize] // Secure this endpoint
         public async Task<ActionResult<List<long>>> GetMutedPlayers(long playerId)
         {
+            // Validate requester matches player ID using ClaimTypes.NameIdentifier
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            // --- Add Logging ---
+            _logger.LogInformation($"MutedList AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'");
+            // -----------------------------------
+            if (requestingPlayerId != playerId.ToString())
+            {
+                 _logger.LogWarning($"MutedList AuthCheck FAILED for PlayerId {playerId}. Token Sub was '{requestingPlayerId ?? "NULL"}'. Returning Forbid.");
+                 return Forbid();
+            }
+            _logger.LogInformation($"MutedList AuthCheck PASSED for PlayerId {playerId}.");
+
             if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found.");
 
             // Find players MUTED BY the specified playerId
@@ -592,8 +792,13 @@ namespace Api.Controllers
 
         // POST: api/players/{muterPlayerId}/muted/{targetPlayerId}
         [HttpPost("{muterPlayerId:long}/muted/{targetPlayerId:long}")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> MutePlayer(long muterPlayerId, long targetPlayerId)
         {
+            // Validate requester matches muterPlayerId
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != muterPlayerId.ToString()) return Forbid();
+
             if (muterPlayerId == targetPlayerId) return BadRequest("Cannot mute yourself.");
             
             // Ensure both players exist
@@ -631,8 +836,13 @@ namespace Api.Controllers
 
         // DELETE: api/players/{muterPlayerId}/muted/{targetPlayerId}
         [HttpDelete("{muterPlayerId:long}/muted/{targetPlayerId:long}")]
+        [Authorize] // Secure this endpoint
         public async Task<IActionResult> UnmutePlayer(long muterPlayerId, long targetPlayerId)
         {
+            // Validate requester matches muterPlayerId
+            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
+            if (requestingPlayerId != muterPlayerId.ToString()) return Forbid();
+
             // Find the mute record
             var muteRecord = await _context.MutedPlayers
                                        .FirstOrDefaultAsync(mp => mp.MuterPlayerId == muterPlayerId && mp.MutedPlayerId == targetPlayerId);

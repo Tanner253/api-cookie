@@ -23,6 +23,11 @@ namespace Api.Data.Models
 
         public DateTime LastLoginAt { get; set; } = DateTime.UtcNow;
 
+        // --- Refresh Token Fields ---
+        public string? RefreshToken { get; set; }
+        public DateTime? RefreshTokenExpiryTime { get; set; }
+        // --------------------------
+
         // Navigation properties
         public virtual PlayerChatInfo? PlayerChatInfo { get; set; }
         public virtual PlayerSettings? PlayerSettings { get; set; }
