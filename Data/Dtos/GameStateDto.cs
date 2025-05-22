@@ -87,6 +87,9 @@ namespace Api.Data.Dtos
         [Required]
         public List<PlayerStatisticDto> PlayerStatistics { get; set; } = new List<PlayerStatisticDto>();
 
+        // ADDED MemeMintData
+        public MemeMintPlayerDataDto? MemeMintData { get; set; } // Initialized to null, will be populated if player has data
+
         // Muted players might be handled by a separate endpoint/DTO due to complexity
         // public List<long> MutedPlayerIds { get; set; } = new List<long>(); 
     }

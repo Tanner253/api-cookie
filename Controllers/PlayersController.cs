@@ -358,7 +358,7 @@ namespace Api.Controllers
             // Validate requester matches player ID using ClaimTypes.NameIdentifier
             var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
             // --- Add Logging ---
-            _logger.LogInformation($"GameState AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'");
+            _logger.LogInformation($"GameState AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'"); 
             // -----------------------------------
             if (requestingPlayerId != playerId.ToString())
             {
@@ -659,11 +659,18 @@ namespace Api.Controllers
         [Authorize] // Secure this endpoint
         public async Task<IActionResult> UpdateChatInfo(long playerId, [FromBody] UpdateUsernameRequestDto requestDto)
         {
-            // Validate requester matches player ID
-            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
-            if (requestingPlayerId != playerId.ToString()) return Forbid();
+            // --- ADD Authorization Check --- 
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            _logger.LogInformation($"UpdateChatInfo AuthCheck: Comparing Token Sub='{requestingPlayerId ?? "NULL"}' with URL PlayerId='{playerId}' (as string: '{playerId.ToString()}')");
+            if (requestingPlayerId != playerId.ToString())
+            {
+                _logger.LogWarning($"UpdateChatInfo AuthCheck FAILED. Token Sub '{requestingPlayerId ?? "NULL"}' != URL PlayerId '{playerId}'. Returning Forbid.");
+                return Forbid();
+            }
+            _logger.LogInformation("UpdateChatInfo AuthCheck PASSED.");
+            // ----------------------------------
 
-            if (requestDto == null || string.IsNullOrWhiteSpace(requestDto.ChatUsername))
+            if (string.IsNullOrWhiteSpace(requestDto.ChatUsername))
             {
                  return BadRequest("Invalid username data provided.");
             }
@@ -716,15 +723,21 @@ namespace Api.Controllers
         [Authorize] // Secure this endpoint
         public async Task<IActionResult> VerifyPlayerAge(long playerId)
         {
-            // Validate requester matches player ID
-            var requestingPlayerId = User.FindFirstValue(JwtRegisteredClaimNames.Sub);
-            if (requestingPlayerId != playerId.ToString()) return Forbid();
+            // --- ADD Authorization Check --- 
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
+            _logger.LogInformation($"VerifyAge AuthCheck: Comparing Token Sub='{requestingPlayerId ?? "NULL"}' with URL PlayerId='{playerId}' (as string: '{playerId.ToString()}')");
+            if (requestingPlayerId != playerId.ToString())
+            {
+                _logger.LogWarning($"VerifyAge AuthCheck FAILED. Token Sub '{requestingPlayerId ?? "NULL"}' != URL PlayerId '{playerId}'. Returning Forbid.");
+                return Forbid();
+            }
+            _logger.LogInformation("VerifyAge AuthCheck PASSED.");
+            // ----------------------------------
 
-            // Find the player's age verification record
-            var playerAgeVerification = await _context.PlayerAgeVerifications
-                                                .FirstOrDefaultAsync(pav => pav.PlayerId == playerId);
+            var player = await _context.Players
+                .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
-            if (playerAgeVerification == null)
+            if (player == null)
             {
                 if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found.");
                 else return StatusCode(500, $"Player age verification record not found for player {playerId}.");
@@ -743,8 +756,8 @@ namespace Api.Controllers
             }
 
             // Update the player's verification status
-            playerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
-            playerAgeVerification.VerifiedAt = DateTime.UtcNow;
+            player.PlayerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
+            player.PlayerAgeVerification.VerifiedAt = DateTime.UtcNow;
             // Optionally update VerificationMethod or AttemptCount if needed
 
             try
@@ -770,7 +783,7 @@ namespace Api.Controllers
             // Validate requester matches player ID using ClaimTypes.NameIdentifier
             var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
             // --- Add Logging ---
-            _logger.LogInformation($"MutedList AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'");
+            _logger.LogInformation($"MutedList AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'"); 
             // -----------------------------------
             if (requestingPlayerId != playerId.ToString())
             {

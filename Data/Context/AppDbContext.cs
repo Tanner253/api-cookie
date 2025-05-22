@@ -35,6 +35,9 @@ namespace Api.Data.Context
         public DbSet<AgeVerificationStatus> AgeVerificationStatuses { get; set; } = null!;
         public DbSet<ChatMessage> ChatMessages { get; set; } = null!;
 
+        // ADD NEW DBSETS for Meme Mint Feature
+        public DbSet<PlayerMemeMintPlayerData> PlayerMemeMintDatas { get; set; } = null!;
+        public DbSet<MinterInstance> MinterInstances { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -250,6 +253,30 @@ namespace Api.Data.Context
             modelBuilder.Entity<Upgrade>()
                 .Property(u => u.CostScalingFactor)
                 .HasPrecision(18, 4); // Example: 18 total digits, 4 decimal places
+
+            // --- New Configurations for Meme Mint Feature ---
+
+            // Player one-to-one PlayerMemeMintPlayerData
+            modelBuilder.Entity<Player>()
+                .HasOne(p => p.MemeMintPlayerData)
+                .WithOne(pmmpd => pmmpd.Player)
+                .HasForeignKey<PlayerMemeMintPlayerData>(pmmpd => pmmpd.PlayerId);
+
+            // PlayerMemeMintPlayerData one-to-many MinterInstances
+            modelBuilder.Entity<PlayerMemeMintPlayerData>()
+                .HasMany(pmmpd => pmmpd.MinterInstances)
+                .WithOne(mi => mi.PlayerMemeMintPlayerData)
+                .HasForeignKey(mi => mi.PlayerMemeMintPlayerDataId);
+
+            // Optional: Composite index on MinterInstance if ClientInstanceId should be unique per player
+            modelBuilder.Entity<MinterInstance>()
+                .HasIndex(mi => new { mi.PlayerMemeMintPlayerDataId, mi.ClientInstanceId })
+                .IsUnique();
+            
+            // Configure decimal precision for PlayerGCMPMPoints if not done via attribute
+            modelBuilder.Entity<PlayerMemeMintPlayerData>()
+                .Property(p => p.PlayerGCMPMPoints)
+                .HasColumnType("decimal(28, 8)"); // Example: 28 total digits, 8 decimal places, adjust as needed
 
             // --- Seed Data --- 
             SeedStaticData(modelBuilder);
