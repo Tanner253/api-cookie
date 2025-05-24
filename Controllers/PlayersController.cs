@@ -8,11 +8,12 @@ using Microsoft.Extensions.Configuration; // Added for IConfiguration
 using Microsoft.Extensions.Logging; // Added for ILogger
 using Microsoft.IdentityModel.Tokens; // Added for JWT
 using System.IdentityModel.Tokens.Jwt; // Added for JWT
-using System.Security.Claims; // Added for JWT
 using System.Text; // Added for JWT
 using Microsoft.AspNetCore.Authorization; // Added for [Authorize]
 using System.Security.Cryptography; // Added for Refresh Token generation
 using System.Security.Claims; // Added for ClaimTypes
+using System.Globalization; // For CultureInfo.InvariantCulture
+using System.Linq;
 
 namespace Api.Controllers
 {
@@ -23,6 +24,13 @@ namespace Api.Controllers
         private readonly AppDbContext _context;
         private readonly IConfiguration _configuration; // Added
         private readonly ILogger<PlayersController> _logger; // Added for ILogger
+
+        // Constants for MemeMint - LATER, move to server configuration or Upgrade entities
+        private const decimal MINT_COST_GOLD_BARS = 50000M;
+        private const float MINT_BASE_DURATION_SECONDS = 3600f;
+        private const int MINT_PROGRESS_PER_CYCLE = 100;
+        private const int MINT_TOTAL_PROGRESS_FOR_BATCH = 600; // Adjusted to 200 for UI screenshot
+        private const decimal MINT_GCM_POINTS_PER_BATCH = 5M;
 
         // Inject IConfiguration and ILogger
         public PlayersController(AppDbContext context, IConfiguration configuration, ILogger<PlayersController> logger)
@@ -355,11 +363,8 @@ namespace Api.Controllers
         [Authorize] // Secure this endpoint
         public async Task<ActionResult<GameStateDto>> GetGameState(long playerId)
         {
-            // Validate requester matches player ID using ClaimTypes.NameIdentifier
             var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
-            // --- Add Logging ---
             _logger.LogInformation($"GameState AuthCheck: Token Sub='{requestingPlayerId ?? "NULL"}', URL PlayerId='{playerId}'"); 
-            // -----------------------------------
             if (requestingPlayerId != playerId.ToString())
             {
                 _logger.LogWarning($"GameState AuthCheck FAILED for PlayerId {playerId}. Token Sub was '{requestingPlayerId ?? "NULL"}'. Returning Forbid.");
@@ -367,18 +372,16 @@ namespace Api.Controllers
             }
             _logger.LogInformation($"GameState AuthCheck PASSED for PlayerId {playerId}.");
 
-            // Fetch the player and all related data needed for the game state
             var player = await _context.Players
                 .Include(p => p.PlayerState)
                 .Include(p => p.PlayerSettings)
-                .Include(p => p.PlayerChatInfo) // Include Chat Info
-                .Include(p => p.PlayerAgeVerification) // Include Age Verification
-                    .ThenInclude(pav => pav.AgeVerificationStatus) // Include the status text if needed
+                .Include(p => p.PlayerChatInfo)
+                .Include(p => p.PlayerAgeVerification).ThenInclude(pav => pav.AgeVerificationStatus)
                 .Include(p => p.PlayerUpgrades)
                 .Include(p => p.PlayerAchievements)
                 .Include(p => p.PlayerStatistics)
-                // Note: Not including MutedPlayers here for simplicity, handle via separate endpoint if needed
-                .AsNoTracking() 
+                .Include(p => p.MemeMintPlayerData)
+                    .ThenInclude(mmpd => mmpd.MinterInstances)
                 .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
             if (player == null)
@@ -386,13 +389,65 @@ namespace Api.Controllers
                 return NotFound($"Player {playerId} not found.");
             }
 
-            // Ensure related entities are loaded (handle potential nulls if relationships aren't guaranteed)
             if (player.PlayerState == null || player.PlayerSettings == null || player.PlayerChatInfo == null || player.PlayerAgeVerification == null)
             {
                 return StatusCode(500, "Player data is incomplete. Missing required state, settings, chat info, or age verification.");
             }
 
-            // Map the entity data to the DTO
+            // Ensure MemeMintPlayerData and default minters exist
+            if (player.MemeMintPlayerData == null)
+            {
+                _logger.LogInformation($"Player {playerId} has no MemeMintPlayerData. Initializing defaults.");
+                player.MemeMintPlayerData = new PlayerMemeMintPlayerData { PlayerId = playerId, CreatedAt = DateTime.UtcNow };
+                InitializeDefaultMinterInstances(player.MemeMintPlayerData);
+                await _context.SaveChangesAsync(); 
+            }
+            else if (player.MemeMintPlayerData.MinterInstances == null || 
+                     !player.MemeMintPlayerData.MinterInstances.Any() || 
+                     player.MemeMintPlayerData.MinterInstances.Count < 3) // Ensure we check for at least 3 for safety
+            {
+                 _logger.LogInformation($"Player {playerId} MemeMintPlayerData exists but MinterInstances are missing/incomplete ({player.MemeMintPlayerData.MinterInstances?.Count ?? 0} found). Re-initializing defaults.");
+                 InitializeDefaultMinterInstances(player.MemeMintPlayerData); 
+                 await _context.SaveChangesAsync();
+            }
+
+            // --- SERVER-SIDE OFFLINE MINTER PROGRESSION (before mapping to DTO) ---
+            if (player.PlayerState != null && player.PlayerState.LastSaveTimestamp > DateTime.MinValue) // Ensure PlayerState exists
+            {
+                TimeSpan offlineTimeSpan = DateTime.UtcNow - player.PlayerState.LastSaveTimestamp;
+                float offlineDurationSeconds = (float)offlineTimeSpan.TotalSeconds;
+                if (offlineDurationSeconds > 10) 
+                {
+                    _logger.LogInformation($"Player {playerId} was offline for {offlineDurationSeconds:F1}s. Processing MemeMint offline logic.");
+                    // <<< Log state of Minter 1 BEFORE offline processing (if it exists) >>>
+                    var minter1BeforeOffline = player.MemeMintPlayerData?.MinterInstances?.FirstOrDefault(m => m.ClientInstanceId == 1);
+                    if (minter1BeforeOffline != null) _logger.LogInformation($"[GetGameState] Minter 1 BEFORE OfflineProcessing: State={minter1BeforeOffline.State}, TimeLeft={minter1BeforeOffline.TimeRemainingSeconds}");
+                    else _logger.LogWarning("[GetGameState] Minter 1 not found before offline processing.");
+
+                    bool changedByOffline = await ProcessAndUpdateMinterCyclesInternal(player, offlineDurationSeconds, true);
+                    if (changedByOffline) 
+                    { 
+                        // <<< Log state of Minter 1 AFTER ProcessAndUpdateMinterCyclesInternal (in memory) but BEFORE SaveChanges >>>
+                        var minter1AfterProcess = player.MemeMintPlayerData?.MinterInstances?.FirstOrDefault(m => m.ClientInstanceId == 1);
+                        if (minter1AfterProcess != null) _logger.LogInformation($"[GetGameState] Minter 1 AFTER ProcessAndUpdateMinterCyclesInternal (pre-save): State={minter1AfterProcess.State}");
+                        
+                        await _context.SaveChangesAsync(); 
+                        _logger.LogInformation($"Saved changes after server-side offline MemeMint processing for player {playerId}.");
+
+                        // <<< OPTIONAL: Re-fetch or ensure context is updated before DTO mapping if issues persist >>>
+                        // player = await _context.Players.Include(...all includes again...).FirstOrDefaultAsync(p => p.PlayerId == playerId); 
+                        // _logger.LogInformation($"Player data re-fetched after offline save for PlayerId {playerId}");
+                    }
+                }
+            }
+            // --- END SERVER-SIDE OFFLINE MINTER PROGRESSION ---
+
+            // <<< Log state of Minter 1 and instance count IMMEDIATELY BEFORE DTO MAPPING >>>
+            _logger.LogInformation($"[GetGameState] PRE-DTO MAPPING: MemeMintPlayerData.MinterInstances count: {player.MemeMintPlayerData?.MinterInstances?.Count ?? -1}");
+            var minter1ForDto = player.MemeMintPlayerData?.MinterInstances?.FirstOrDefault(m => m.ClientInstanceId == 1);
+            if (minter1ForDto != null) _logger.LogError($"[GetGameState] Minter 1 FOR DTO MAPPING: ID={minter1ForDto.ClientInstanceId}, EntityState={minter1ForDto.State}, TimeLeft={minter1ForDto.TimeRemainingSeconds}");
+            else _logger.LogWarning("[GetGameState] Minter 1 NOT FOUND for DTO mapping.");
+
             var gameStateDto = new GameStateDto
             {
                 PlayerState = new PlayerStateDto
@@ -418,29 +473,154 @@ namespace Api.Controllers
                 },
                 PlayerAgeVerification = new PlayerAgeVerificationDto
                 {
-                    // Explicitly check each part, add null-forgiving (!) to satisfy compiler
-                    IsVerified = player.PlayerAgeVerification != null && 
-                                 player.PlayerAgeVerification.AgeVerificationStatus != null &&
-                                 player.PlayerAgeVerification.AgeVerificationStatus!.Status == "Verified"
+                    IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified"
                 },
-                PlayerUpgrades = player.PlayerUpgrades.Select(pu => new PlayerUpgradeDto
+                PlayerUpgrades = player.PlayerUpgrades?.Select(pu => new PlayerUpgradeDto
                 {
                     UpgradeId = pu.UpgradeId,
                     Level = pu.Level
-                }).ToList(),
-                PlayerAchievements = player.PlayerAchievements.Select(pa => new PlayerAchievementDto
+                }).ToList() ?? new List<PlayerUpgradeDto>(),
+                PlayerAchievements = player.PlayerAchievements?.Select(pa => new PlayerAchievementDto
                 {
                     AchievementId = pa.AchievementId,
                     UnlockedAt = pa.UnlockedAt
-                }).ToList(),
+                }).ToList() ?? new List<PlayerAchievementDto>(),
                 PlayerStatistics = player.PlayerStatistics.Select(ps => new PlayerStatisticDto
                 {
                     StatisticDefinitionId = ps.StatisticDefinitionId,
                     NumericValue = ps.NumericValue
-                }).ToList()
+                }).ToList(),
+
+                MemeMintData = player.MemeMintPlayerData == null ? new MemeMintPlayerDataDto() : new MemeMintPlayerDataDto // Ensure DTO is not null
+                {
+                    PlayerGCMPMPoints = player.MemeMintPlayerData?.PlayerGCMPMPoints ?? 0,
+                    SharedMintProgress = player.MemeMintPlayerData?.SharedMintProgress ?? 0,
+                    MinterInstances = player.MemeMintPlayerData?.MinterInstances? // Null-conditional access
+                        .Select(mi => new MinterInstanceDataDto
+                        {
+                            InstanceId = mi.ClientInstanceId,
+                            State = (MinterStateDto)mi.State,
+                            TimeRemainingSeconds = mi.TimeRemainingSeconds,
+                            IsUnlocked = mi.IsUnlocked
+                        }).ToList() ?? new List<MinterInstanceDataDto>() // Default to empty list if MinterInstances is null
+                }
             };
+            // Repopulate other DTO fields as they were
+            gameStateDto.PlayerState.CurrentScore = player.PlayerState.CurrentScore;
+            gameStateDto.PlayerState.TotalLifeTimeScoreEarned = player.PlayerState.TotalLifeTimeScoreEarned;
+            gameStateDto.PlayerState.GoldBars = player.PlayerState.GoldBars;
+            gameStateDto.PlayerState.PrestigeCount = player.PlayerState.PrestigeCount;
+            gameStateDto.PlayerState.LastSaveTimestamp = player.PlayerState.LastSaveTimestamp;
+            gameStateDto.PlayerState.StoredOfflineTimeSeconds = player.PlayerState.StoredOfflineTimeSeconds;
+            gameStateDto.PlayerState.MaxOfflineStorageHours = player.PlayerState.MaxOfflineStorageHours;
+            gameStateDto.PlayerState.TimePerClickSecond = player.PlayerState.TimePerClickSecond;
+
+            gameStateDto.PlayerSettings.MusicVolume = player.PlayerSettings.MusicVolume;
+            gameStateDto.PlayerSettings.SfxVolume = player.PlayerSettings.SfxVolume;
+            gameStateDto.PlayerSettings.NotificationsEnabled = player.PlayerSettings.NotificationsEnabled;
+
+            gameStateDto.PlayerChatInfo.ChatUsername = player.PlayerChatInfo?.ChatUsername;
+            gameStateDto.PlayerAgeVerification.IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified";
 
             return Ok(gameStateDto);
+        }
+
+        // Server-authoritative processing of minter cycles and rewards
+        private async Task<bool> ProcessAndUpdateMinterCyclesInternal(Player player, float? elapsedSecondsOverride = null, bool isOfflineCalculation = false)
+        {
+            if (player.MemeMintPlayerData == null) 
+            {
+                _logger.LogWarning($"ProcessMinterCycles: Player {player.PlayerId} has no MemeMintPlayerData.");
+                return false; 
+            }
+
+            _logger.LogInformation($"[ProcessInternal] Processing Minter Cycles for Player {player.PlayerId}. isOffline: {isOfflineCalculation}, elapsedOverride: {elapsedSecondsOverride?.ToString("F1") ?? "N/A"}");
+
+            bool anyChangeMade = false;
+            DateTime currentTimeUtc = DateTime.UtcNow;
+
+            foreach (var minter in player.MemeMintPlayerData.MinterInstances.ToList())
+            {
+                if (minter.State == MinterState.MintingInProgress && minter.IsUnlocked)
+                {
+                    float elapsedSinceLastStart = 0f;
+                    if (minter.LastCycleStartTimeUTC != null)
+                    {
+                        elapsedSinceLastStart = (float)(currentTimeUtc - minter.LastCycleStartTimeUTC.Value).TotalSeconds;
+                    }
+
+                    // If an explicit elapsedSecondsOverride is provided (e.g., for offline calculation based on LastSaveTime),
+                    // use that instead of calculating from LastCycleStartTimeUTC for this specific pass.
+                    // This handles the scenario where LastCycleStartTimeUTC might be very old due to long offline time.
+                    float durationToProcess = elapsedSecondsOverride ?? elapsedSinceLastStart;
+                    
+                    // How much time was *actually* remaining in the cycle when it was last known to be running.
+                    // If LastCycleStartTimeUTC is recent, TimeRemainingSeconds should be accurate.
+                    // If it's an old LastCycleStartTimeUTC, TimeRemainingSeconds might be the full cycle time.
+                    float timeActuallyLeftInCycle = minter.TimeRemainingSeconds;
+                    
+                    if (durationToProcess >= timeActuallyLeftInCycle && timeActuallyLeftInCycle > 0) // Cycle completed
+                    {
+                        int cyclesCompletedThisPass = 0;
+                        if (isOfflineCalculation) // For offline, calculate all possible completions
+                        {
+                            cyclesCompletedThisPass = 1; // The one that was running
+                            float remainingOfflineTimeToConsiderForMoreCycles = durationToProcess - timeActuallyLeftInCycle;
+                            // As per your requirement, minters don't auto-restart offline.
+                            // So, we only complete the one cycle that was in progress.
+                            minter.TimeRemainingSeconds = 0;
+                        }
+                        else // For online /process call, likely means the current cycle just finished
+                        {
+                            cyclesCompletedThisPass = 1;
+                            minter.TimeRemainingSeconds = 0;
+                        }
+
+                        if (cyclesCompletedThisPass > 0)
+                        {
+                            _logger.LogInformation($"[ProcessInternal] Minter {minter.ClientInstanceId} PRE-STATE-CHANGE: Current State={minter.State}");
+                            minter.State = MinterState.CycleCompleted; 
+                            minter.LastCycleStartTimeUTC = null; 
+                            anyChangeMade = true;
+                            _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} cycle completed. NEW State: {minter.State}. (Offline: {isOfflineCalculation})");
+                        }
+                    }
+                    else if (durationToProcess > 0) // Partially progressed but not finished
+                    {
+                        float oldTimeRemaining = minter.TimeRemainingSeconds;
+                        minter.TimeRemainingSeconds = Math.Max(0, timeActuallyLeftInCycle - durationToProcess);
+                        anyChangeMade = true;
+                        _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} timer updated. OldTime: {oldTimeRemaining:F1}s, NewTime: {minter.TimeRemainingSeconds:F1}s. (Offline: {isOfflineCalculation})");
+                    }
+                    minter.UpdatedAt = currentTimeUtc;
+                }
+            }
+
+            // Batch rewards are now handled when client calls /collect endpoint
+            if (anyChangeMade) player.MemeMintPlayerData.UpdatedAt = currentTimeUtc;
+            return anyChangeMade;
+        }
+
+        private void InitializeDefaultMinterInstances(PlayerMemeMintPlayerData playerData)
+        {
+            if (playerData.MinterInstances == null) playerData.MinterInstances = new List<MinterInstance>();
+            int targetInstanceCount = 3; // Default to 3 slots
+            for (int i = 0; i < targetInstanceCount; i++)
+            {
+                int clientInstanceId = i + 1;
+                if (!playerData.MinterInstances.Any(m => m.ClientInstanceId == clientInstanceId))
+                {
+                    playerData.MinterInstances.Add(new MinterInstance
+                    {
+                        ClientInstanceId = clientInstanceId,
+                        IsUnlocked = (clientInstanceId == 1), // First is unlocked
+                        State = MinterState.Idle,
+                        TimeRemainingSeconds = 0f,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    });
+                }
+            }
         }
 
         // PUT: api/players/{playerId}/gameState
@@ -448,161 +628,128 @@ namespace Api.Controllers
         [Authorize] // Secure this endpoint
         public async Task<IActionResult> UpdateGameState(long playerId, [FromBody] GameStateDto gameStateDto)
         {
-            // Validate requester matches player ID
-            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); // This should now correctly get "3"
-            
-            // --- ADD DETAILED LOGGING FOR PUT --- 
-            _logger.LogInformation($"UpdateGameState AuthCheck: Comparing Token Sub='{requestingPlayerId ?? "NULL"}' with URL PlayerId='{playerId}' (as string: '{playerId.ToString()}')");
-            // ------------------------------------
-            
-            if (requestingPlayerId != playerId.ToString()) 
-            {
-                _logger.LogWarning($"UpdateGameState AuthCheck FAILED. Token Sub '{requestingPlayerId ?? "NULL"}' != URL PlayerId '{playerId}'. Returning Forbid.");
-                return Forbid(); // <<< This is the check causing the 403
-            }
-            _logger.LogInformation("UpdateGameState AuthCheck PASSED.");
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (requestingPlayerId != playerId.ToString()) return Forbid();
 
             var player = await _context.Players
                 .Include(p => p.PlayerState)
                 .Include(p => p.PlayerSettings)
-                .Include(p => p.PlayerChatInfo) // Include Chat Info
-                .Include(p => p.PlayerAgeVerification) // Include Age Verification
+                .Include(p => p.PlayerChatInfo)
+                .Include(p => p.PlayerAgeVerification)
                 .Include(p => p.PlayerUpgrades)
                 .Include(p => p.PlayerAchievements)
                 .Include(p => p.PlayerStatistics)
-                // Not including MutedPlayers
+                // MemeMintPlayerData and MinterInstances are NOT loaded here for update via this generic endpoint.
+                // They are handled by specific MemeMint endpoints (start, collect) and server-side processing (GetGameState).
                 .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
-            if (player == null)
-            {
-                return NotFound($"Player {playerId} not found.");
-            }
+            if (player == null) return NotFound($"Player {playerId} not found.");
+            if (player.PlayerState == null) player.PlayerState = new PlayerState(); // Ensure it exists
+            if (player.PlayerSettings == null) player.PlayerSettings = new PlayerSettings();
+            if (player.PlayerChatInfo == null) player.PlayerChatInfo = new PlayerChatInfo();
+            if (player.PlayerAgeVerification == null) player.PlayerAgeVerification = new PlayerAgeVerification { AgeVerificationStatusId = 1 };
 
-            if (player.PlayerState == null || player.PlayerSettings == null || player.PlayerChatInfo == null || player.PlayerAgeVerification == null)
-            {
-                return StatusCode(500, "Player data is incomplete. Cannot save state.");
-            }
-
-            // --- Update PlayerState ---
+            // Update PlayerState
             var stateDto = gameStateDto.PlayerState;
+            _logger.LogInformation($"[UpdateGameState] PlayerID: {playerId}. Received GoldBars from client: {stateDto.GoldBars}");
+            player.PlayerState.GoldBars = stateDto.GoldBars; 
             player.PlayerState.CurrentScore = stateDto.CurrentScore;
             player.PlayerState.TotalLifeTimeScoreEarned = stateDto.TotalLifeTimeScoreEarned;
-            player.PlayerState.GoldBars = stateDto.GoldBars;
             player.PlayerState.PrestigeCount = stateDto.PrestigeCount;
-            player.PlayerState.LastSaveTimestamp = DateTime.UtcNow;
             player.PlayerState.StoredOfflineTimeSeconds = stateDto.StoredOfflineTimeSeconds;
             player.PlayerState.MaxOfflineStorageHours = stateDto.MaxOfflineStorageHours;
             player.PlayerState.TimePerClickSecond = stateDto.TimePerClickSecond;
             player.PlayerState.UpdatedAt = DateTime.UtcNow;
+            // LastSaveTimestamp is critical for offline calculations. It's set here.
+            player.PlayerState.LastSaveTimestamp = DateTime.UtcNow; 
 
-            // --- Update PlayerSettings ---
+            // Update PlayerSettings
             var settingsDto = gameStateDto.PlayerSettings;
             player.PlayerSettings.MusicVolume = settingsDto.MusicVolume;
             player.PlayerSettings.SfxVolume = settingsDto.SfxVolume;
             player.PlayerSettings.NotificationsEnabled = settingsDto.NotificationsEnabled;
             player.PlayerSettings.UpdatedAt = DateTime.UtcNow;
 
-            // --- Update PlayerChatInfo ---
-            // REMOVED: Username update is now handled by a dedicated API call
-            // var chatInfoDto = gameStateDto.PlayerChatInfo;
-            // player.PlayerChatInfo.ChatUsername = chatInfoDto.ChatUsername;
-            // player.PlayerChatInfo.UpdatedAt = DateTime.UtcNow;
-
-            // --- Update PlayerAgeVerification ---
-            // This might require more complex logic. 
-            // For now, let's assume we just store the client's claimed status.
-            // We'd need to load the relevant AgeVerificationStatus ID ("Verified" or "Not Verified")
-            var ageDto = gameStateDto.PlayerAgeVerification;
-            // Example: Find the ID for the status based on ageDto.IsVerified 
-            // long targetStatusId = await _context.AgeVerificationStatuses
-            //     .Where(s => s.Status == (ageDto.IsVerified ? "Verified" : "Not Verified"))
-            //     .Select(s => s.Id)
-            //     .FirstOrDefaultAsync();
-            // if (targetStatusId != 0) { 
-            //     player.PlayerAgeVerification.AgeVerificationStatusId = targetStatusId;
-            //     player.PlayerAgeVerification.VerifiedAt = ageDto.IsVerified ? (player.PlayerAgeVerification.VerifiedAt ?? DateTime.UtcNow) : null; // Set timestamp only if verified
-            //     player.PlayerAgeVerification.UpdatedAt = DateTime.UtcNow;
-            // }
-            // Simplifying for now - assuming verification logic is handled elsewhere or not updated via this endpoint
-            // Potential TODO: Add dedicated endpoint for age verification update?
-
-            // --- Update PlayerUpgrades (Remove & Add approach) ---
-            _context.PlayerUpgrades.RemoveRange(player.PlayerUpgrades);
-            player.PlayerUpgrades.Clear();
-            foreach (var upgradeDto in gameStateDto.PlayerUpgrades)
-            {
-                player.PlayerUpgrades.Add(new PlayerUpgrade
-                {
-                    PlayerId = playerId,
-                    UpgradeId = upgradeDto.UpgradeId,
-                    Level = upgradeDto.Level,
-                    PurchasedAt = DateTime.UtcNow, // Assuming new/updated upgrades are 'purchased' now
-                    LastLeveledAt = DateTime.UtcNow
-                });
+            // Update PlayerUpgrades (example: replace all with client's list)
+            _context.PlayerUpgrades.RemoveRange(player.PlayerUpgrades); // EF Core handles tracking
+            player.PlayerUpgrades.Clear(); // Clear navigation property
+            foreach (var upgradeDto in gameStateDto.PlayerUpgrades) 
+            { 
+                player.PlayerUpgrades.Add(new PlayerUpgrade 
+                { 
+                    PlayerId = playerId, 
+                    UpgradeId = upgradeDto.UpgradeId, 
+                    Level = upgradeDto.Level, 
+                    PurchasedAt = DateTime.UtcNow, // Assuming new/updated upgrades are "purchased" now
+                    LastLeveledAt = DateTime.UtcNow 
+                }); 
             }
 
-            // --- Update PlayerAchievements (Remove & Add approach) ---
+            // Update PlayerAchievements (example: replace all)
             _context.PlayerAchievements.RemoveRange(player.PlayerAchievements);
             player.PlayerAchievements.Clear();
-            foreach (var achievementDto in gameStateDto.PlayerAchievements)
-            {
-                player.PlayerAchievements.Add(new PlayerAchievement
-                {
-                    PlayerId = playerId,
-                    AchievementId = achievementDto.AchievementId,
-                    UnlockedAt = achievementDto.UnlockedAt, // Use timestamp from client if meaningful
-                    RewardClaimed = false // Default or handle based on DTO if claim status is sent
-                });
+            foreach (var achievementDto in gameStateDto.PlayerAchievements) 
+            { 
+                player.PlayerAchievements.Add(new PlayerAchievement 
+                { 
+                    PlayerId = playerId, 
+                    AchievementId = achievementDto.AchievementId, 
+                    UnlockedAt = achievementDto.UnlockedAt, 
+                    RewardClaimed = false // Assuming DTO doesn't send this, or server sets it
+                }); 
             }
 
-            // --- Update PlayerStatistics (Remove & Add approach) ---
+            // Update PlayerStatistics (example: replace all)
             _context.PlayerStatistics.RemoveRange(player.PlayerStatistics);
             player.PlayerStatistics.Clear();
-            foreach (var statisticDto in gameStateDto.PlayerStatistics)
-            {
-                player.PlayerStatistics.Add(new PlayerStatistic
-                {
-                    PlayerId = playerId,
-                    StatisticDefinitionId = statisticDto.StatisticDefinitionId,
-                    NumericValue = statisticDto.NumericValue,
-                    LastUpdatedAt = DateTime.UtcNow
-                });
+            foreach (var statisticDto in gameStateDto.PlayerStatistics) 
+            { 
+                player.PlayerStatistics.Add(new PlayerStatistic 
+                { 
+                    PlayerId = playerId, 
+                    StatisticDefinitionId = statisticDto.StatisticDefinitionId, 
+                    NumericValue = statisticDto.NumericValue, 
+                    LastUpdatedAt = DateTime.UtcNow 
+                }); 
             }
 
-            // Update Player's LastLoginAt
-            player.LastLoginAt = DateTime.UtcNow;
+            // --- MemeMintData and MinterInstances are NO LONGER updated through this general endpoint ---
+            // All MemeMintData and MinterInstance changes are authoritatively handled by:
+            // 1. GET /gameState: Server calculates offline progress and returns current authoritative state.
+            // 2. POST /mememint/minters/{clientInstanceId}/start: Server initiates a minter cycle.
+            // 3. POST /mememint/minters/{clientInstanceId}/collect: Server processes collection and grants rewards/progress.
+            // The client should not send MemeMintData or MinterInstances in the UpdateGameState request payload.
+            // If player.MemeMintPlayerData needs initialization, it happens during GET /gameState.
+            _logger.LogInformation($"[UpdateGameState] PlayerID: {playerId}. Any MemeMintData in the DTO is ignored by this endpoint.");
 
-            // Explicitly detach PlayerChatInfo to prevent implicit updates during the final save
-            if (player.PlayerChatInfo != null) // Add null check for safety
+            // Update LastLoginAt for the player
+            player.LastLoginAt = DateTime.UtcNow;
+            
+            // Detach PlayerChatInfo if it was loaded to prevent unintended updates if its DTO part wasn't handled
+            // (or handle its update explicitly if gameStateDto can change it)
+            if (player.PlayerChatInfo != null && _context.Entry(player.PlayerChatInfo).State != EntityState.Detached) 
             {
-                 _context.Entry(player.PlayerChatInfo).State = EntityState.Detached;
+                _context.Entry(player.PlayerChatInfo).State = EntityState.Detached;
             }
 
             try
             {
                 await _context.SaveChangesAsync();
+                _logger.LogInformation($"[UpdateGameState] PlayerID: {playerId} general state save completed.");
             }
-            catch (DbUpdateConcurrencyException)
+            catch (DbUpdateConcurrencyException ex)
             {
-                // Handle potential concurrency issues if necessary
-                if (!await PlayerExists(playerId))
-                {
-                    return NotFound($"Player {playerId} not found during save.");
-                }
-                else
-                {
-                    throw; // Re-throw if it's another concurrency issue
-                }
+                _logger.LogError(ex, $"[UpdateGameState] Concurrency conflict for PlayerID {playerId}.");
+                // Handle concurrency issues, e.g., by reloading or informing client.
+                return Conflict("Data has been modified by another process. Please refresh and try again.");
             }
-            catch (Exception ex)
+            catch (DbUpdateException ex)
             {
-                // Log the exception ex
-                Console.WriteLine($"ERROR updating game state for player {playerId}: {ex.Message}"); // Basic console logging
-                // Consider using a proper logging framework
+                _logger.LogError(ex, $"[UpdateGameState] Database update error for PlayerID {playerId}.");
                 return StatusCode(500, "An error occurred while saving game state.");
             }
-
-            return NoContent(); // Success
+            
+            return NoContent();
         }
 
         // DELETE: api/players/{playerId}
@@ -750,15 +897,20 @@ namespace Api.Controllers
                                             .FirstOrDefaultAsync();
 
             if (verifiedStatusId == 0) {
-                // This indicates a seeding issue or data problem
                 Console.WriteLine($"ERROR verifying age for player {playerId}: 'Verified' status not found in DB.");
                 return StatusCode(500, "Server configuration error: Cannot find 'Verified' status.");
             }
 
-            // Update the player's verification status
-            player.PlayerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
-            player.PlayerAgeVerification.VerifiedAt = DateTime.UtcNow;
-            // Optionally update VerificationMethod or AttemptCount if needed
+            if (player.PlayerAgeVerification != null) // Ensure PlayerAgeVerification exists
+            {
+                player.PlayerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
+                player.PlayerAgeVerification.VerifiedAt = DateTime.UtcNow;
+            }
+            else
+            {
+                _logger.LogError($"[VerifyPlayerAge] PlayerAgeVerification is null for PlayerID {playerId}. Cannot set as verified.");
+                return StatusCode(500, "Player age verification record not found.");
+            }
 
             try
             {
@@ -875,6 +1027,235 @@ namespace Api.Controllers
                 Console.WriteLine($"ERROR unmuting player {targetPlayerId} by {muterPlayerId}: {ex.Message}");
                 return StatusCode(500, "An error occurred while unmuting player.");
             }
+        }
+
+        // Add this new helper method inside PlayersController class if it's missing
+        // or ensure it's correctly defined from previous steps.
+        public float GetBaseMintingTimeForInstance(int clientInstanceId)
+        {
+            // TODO: Fetch this from config or player's specific upgrade level for this minter
+            // THIS MUST BE SERVER-AUTHORITATIVE LATER.
+            _logger.LogInformation($"[PlayersController] GetBaseMintingTimeForInstance called for ClientInstanceId: {clientInstanceId}. Returning MINT_BASE_DURATION_SECONDS: {MINT_BASE_DURATION_SECONDS}f.");
+            return MINT_BASE_DURATION_SECONDS; 
+        }
+
+        // POST: api/players/{playerId}/mememint/minters/{clientInstanceId}/start
+        [HttpPost("{playerId:long}/mememint/minters/{clientInstanceId:int}/start")]
+        [Authorize]
+        public async Task<ActionResult<StartMinterResponseDto>> StartMinterCycle(long playerId, int clientInstanceId)
+        {
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (requestingPlayerId != playerId.ToString())
+            {
+                _logger.LogWarning($"[StartMinterCycle] Auth FAILED for PlayerId {playerId}. Token Sub was '{requestingPlayerId ?? "NULL"}'.");
+                return Forbid();
+            }
+
+            var player = await _context.Players
+                .Include(p => p.PlayerState)
+                .Include(p => p.MemeMintPlayerData)
+                    .ThenInclude(mmpd => mmpd.MinterInstances)
+                .FirstOrDefaultAsync(p => p.PlayerId == playerId);
+
+            if (player == null || player.PlayerState == null)
+            {
+                return NotFound($"Player or PlayerState not found for PlayerId {playerId}.");
+            }
+
+            if (player.MemeMintPlayerData == null)
+            {
+                _logger.LogWarning($"[StartMinterCycle] Player {playerId} does not have MemeMintPlayerData initialized. Creating one.");
+                // If MemeMintPlayerData is null, create it and its default minter instances
+                player.MemeMintPlayerData = new PlayerMemeMintPlayerData { PlayerId = playerId, CreatedAt = DateTime.UtcNow };
+                // Initialize default minters for the new PlayerMemeMintPlayerData
+                int targetInstanceCount = 3; // Or get from config
+                for (int i = 0; i < targetInstanceCount; i++)
+                {
+                    int newInstanceId = i + 1;
+                    player.MemeMintPlayerData.MinterInstances.Add(new MinterInstance
+                    {
+                        ClientInstanceId = newInstanceId,
+                        IsUnlocked = (newInstanceId == 1), // Only instance 1 is unlocked by default
+                        State = MinterState.Idle,
+                        TimeRemainingSeconds = 0f,
+                        CreatedAt = DateTime.UtcNow,
+                        UpdatedAt = DateTime.UtcNow
+                    });
+                }
+                // _context.PlayerMemeMintDatas.Add(player.MemeMintPlayerData); // EF Core tracks it via player navigation property
+            }
+
+            var minter = player.MemeMintPlayerData.MinterInstances
+                               .FirstOrDefault(mi => mi.ClientInstanceId == clientInstanceId);
+
+            if (minter == null)
+            {
+                // This case should be rare now if we auto-initialize above, but keep as a safeguard
+                _logger.LogWarning($"[StartMinterCycle] Minter instance {clientInstanceId} not found for PlayerId {playerId} even after attempting init.");
+                return NotFound($"Minter instance {clientInstanceId} not found.");
+            }
+
+            if (!minter.IsUnlocked)
+            {
+                _logger.LogWarning($"[StartMinterCycle] Minter instance {clientInstanceId} for PlayerId {playerId} is locked.");
+                return BadRequest("Minter instance is locked.");
+            }
+
+            if (minter.State != MinterState.Idle)
+            {
+                _logger.LogWarning($"[StartMinterCycle] Minter instance {clientInstanceId} for PlayerId {playerId} is not Idle (Current: {minter.State}).");
+                return Conflict("Minter instance is already processing or completed.");
+            }
+
+            decimal costPerMintActionGB = MINT_COST_GOLD_BARS; 
+
+            if (!decimal.TryParse(player.PlayerState.GoldBars, NumberStyles.Any, CultureInfo.InvariantCulture, out decimal currentGoldBarsOnServer))
+            {
+                _logger.LogError($"[StartMinterCycle] Failed to parse GoldBars for PlayerId {playerId} from PlayerState: {player.PlayerState.GoldBars}");
+                currentGoldBarsOnServer = 0; 
+            }
+
+            if (currentGoldBarsOnServer < costPerMintActionGB)
+            {
+                _logger.LogWarning($"[StartMinterCycle] PlayerId {playerId} has insufficient GoldBars. Needs {costPerMintActionGB}, has {currentGoldBarsOnServer}.");
+                return StatusCode(402, "Insufficient Gold Bars."); 
+            }
+
+            player.PlayerState.GoldBars = (currentGoldBarsOnServer - costPerMintActionGB).ToString(CultureInfo.InvariantCulture);
+            player.PlayerState.UpdatedAt = DateTime.UtcNow;
+
+            float baseMintingTime = GetBaseMintingTimeForInstance(clientInstanceId); 
+            minter.State = MinterState.MintingInProgress;
+            minter.TimeRemainingSeconds = baseMintingTime; 
+            minter.LastCycleStartTimeUTC = DateTime.UtcNow;
+            minter.UpdatedAt = DateTime.UtcNow;
+            
+            player.MemeMintPlayerData.UpdatedAt = DateTime.UtcNow; 
+
+            try
+            {
+                await _context.SaveChangesAsync();
+                _logger.LogInformation($"[StartMinterCycle] PlayerId {playerId}, Minter {clientInstanceId} started. Deducted {costPerMintActionGB} GB. New GB: {player.PlayerState.GoldBars}. Timer: {minter.TimeRemainingSeconds}s.");
+
+                var responseDto = new StartMinterResponseDto
+                {
+                    UpdatedMinterInstance = new MinterInstanceDataDto
+                    {
+                        InstanceId = minter.ClientInstanceId,
+                        State = (MinterStateDto)minter.State,
+                        TimeRemainingSeconds = minter.TimeRemainingSeconds,
+                        IsUnlocked = minter.IsUnlocked
+                    },
+                    NewGoldBarBalance = player.PlayerState.GoldBars,
+                    ServerTimeUtc = minter.LastCycleStartTimeUTC ?? DateTime.UtcNow 
+                };
+                return Ok(responseDto);
+            }
+            catch (DbUpdateException ex)
+            {
+                _logger.LogError(ex, $"[StartMinterCycle] DbUpdateException for PlayerId {playerId}, Minter {clientInstanceId}.");
+                return StatusCode(500, "An error occurred while starting the minting cycle.");
+            }
+        }
+
+        // POST: api/players/{playerId}/mememint/minters/{clientInstanceId}/collect
+        [HttpPost("{playerId:long}/mememint/minters/{clientInstanceId:int}/collect")]
+        [Authorize]
+        public async Task<ActionResult<ProcessCyclesResponseDto>> CollectMinterCycle(long playerId, int clientInstanceId)
+        {
+            var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            if (requestingPlayerId != playerId.ToString()) return Forbid();
+
+            var player = await _context.Players
+                .Include(p => p.PlayerState) 
+                .Include(p => p.MemeMintPlayerData).ThenInclude(mmpd => mmpd!.MinterInstances)
+                .FirstOrDefaultAsync(p => p.PlayerId == playerId);
+
+            if (player?.MemeMintPlayerData == null) 
+            {
+                _logger.LogWarning($"[CollectMinterCycle] Player {playerId} or their MemeMintPlayerData not found.");
+                return NotFound("Player or MemeMintData not found.");
+            }
+
+            var minter = player.MemeMintPlayerData.MinterInstances.FirstOrDefault(mi => mi.ClientInstanceId == clientInstanceId);
+            if (minter == null) 
+            {
+                _logger.LogWarning($"[CollectMinterCycle] Minter {clientInstanceId} for player {playerId} not found.");
+                return NotFound("Minter not found.");
+            }
+
+            // --- NEW: Check if minter is MintingInProgress but actually completed by server time ---
+            if (minter.State == MinterState.MintingInProgress && minter.LastCycleStartTimeUTC.HasValue)
+            {
+                float elapsedOnServer = (float)(DateTime.UtcNow - minter.LastCycleStartTimeUTC.Value).TotalSeconds;
+                // Check if it should have completed based on its original TimeRemainingSeconds at the start of the cycle
+                // This assumes TimeRemainingSeconds was set to full duration when MintingInProgress began.
+                // We need to fetch the original cycle duration (MINT_BASE_DURATION_SECONDS for now)
+                float originalCycleDuration = GetBaseMintingTimeForInstance(minter.ClientInstanceId); // Use helper
+
+                if (elapsedOnServer >= originalCycleDuration) 
+                {
+                    _logger.LogInformation($"[CollectMinterCycle] Minter {clientInstanceId} for player {playerId} was MintingInProgress but server time indicates completion. Elapsed: {elapsedOnServer}s, OriginalDuration: {originalCycleDuration}s. Updating to CycleCompleted.");
+                    minter.State = MinterState.CycleCompleted;
+                    minter.TimeRemainingSeconds = 0; 
+                    minter.LastCycleStartTimeUTC = null; 
+                    minter.UpdatedAt = DateTime.UtcNow;
+                    player.MemeMintPlayerData.UpdatedAt = DateTime.UtcNow; 
+                }
+            }
+            // --- END NEW CHECK ---
+
+            if (minter.State != MinterState.CycleCompleted)
+            {
+                _logger.LogWarning($"[CollectMinterCycle] Minter {clientInstanceId} for player {playerId} is not in CycleCompleted state (Current: {minter.State}). Cannot collect.");
+                return BadRequest("Minter cycle not completed or already collected.");
+            }
+
+            player.MemeMintPlayerData.SharedMintProgress += MINT_PROGRESS_PER_CYCLE;
+            minter.State = MinterState.Idle; 
+            minter.TimeRemainingSeconds = 0;
+            minter.LastCycleStartTimeUTC = null;
+            minter.UpdatedAt = DateTime.UtcNow;
+
+            _logger.LogInformation($"Player {playerId}, Minter {minter.ClientInstanceId} COLLECTED. SharedProgress now: {player.MemeMintPlayerData.SharedMintProgress}");
+
+            if (player.MemeMintPlayerData.SharedMintProgress >= MINT_TOTAL_PROGRESS_FOR_BATCH)
+            {
+                int batchesCompleted = player.MemeMintPlayerData.SharedMintProgress / MINT_TOTAL_PROGRESS_FOR_BATCH;
+                decimal pointsEarnedThisTime = batchesCompleted * MINT_GCM_POINTS_PER_BATCH;
+                player.MemeMintPlayerData.PlayerGCMPMPoints += pointsEarnedThisTime;
+                player.MemeMintPlayerData.SharedMintProgress %= MINT_TOTAL_PROGRESS_FOR_BATCH;
+                _logger.LogInformation($"Player {playerId} BATCH REWARD from collect: Earned {pointsEarnedThisTime} GCM. New Total GCM: {player.MemeMintPlayerData.PlayerGCMPMPoints}. SharedProgress now: {player.MemeMintPlayerData.SharedMintProgress}");
+            }
+            
+            player.MemeMintPlayerData.UpdatedAt = DateTime.UtcNow;
+            
+            try
+            {
+                await _context.SaveChangesAsync();
+                _logger.LogInformation($"Player {playerId}, Minter {clientInstanceId} collection processed and saved.");
+            }
+            catch (DbUpdateException ex)
+            {
+                _logger.LogError(ex, $"[CollectMinterCycle] DbUpdateException for PlayerId {playerId}, Minter {clientInstanceId} during collect.");
+                return StatusCode(500, "An error occurred while collecting minter reward.");
+            }
+
+            return Ok(new ProcessCyclesResponseDto 
+            {
+                UpdatedMemeMintData = new MemeMintPlayerDataDto 
+                {
+                    PlayerGCMPMPoints = player.MemeMintPlayerData.PlayerGCMPMPoints,
+                    SharedMintProgress = player.MemeMintPlayerData.SharedMintProgress,
+                    MinterInstances = player.MemeMintPlayerData.MinterInstances.Select(mi => new MinterInstanceDataDto
+                    {
+                        InstanceId = mi.ClientInstanceId,
+                        State = (MinterStateDto)mi.State,
+                        TimeRemainingSeconds = mi.TimeRemainingSeconds,
+                        IsUnlocked = mi.IsUnlocked
+                    }).ToList()
+                }
+            });
         }
 
     }

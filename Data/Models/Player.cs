@@ -32,6 +32,7 @@ namespace Api.Data.Models
         public virtual PlayerChatInfo? PlayerChatInfo { get; set; }
         public virtual PlayerSettings? PlayerSettings { get; set; }
         public virtual PlayerState? PlayerState { get; set; }
+        public virtual PlayerMemeMintPlayerData? MemeMintPlayerData { get; set; }
         public virtual ICollection<PlayerStatistic> PlayerStatistics { get; set; } = new List<PlayerStatistic>();
         public virtual ICollection<PlayerAchievement> PlayerAchievements { get; set; } = new List<PlayerAchievement>();
         public virtual ICollection<PlayerUpgrade> PlayerUpgrades { get; set; } = new List<PlayerUpgrade>();
