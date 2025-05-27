@@ -12,8 +12,8 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Api.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    [Migration("20250523175240_minting2")]
-    partial class minting2
+    [Migration("20250527015733_playerId")]
+    partial class playerId
     {
         /// <inheritdoc />
         protected override void BuildTargetModel(ModelBuilder modelBuilder)
@@ -103,6 +103,36 @@ namespace Api.Migrations
                             RewardAmount = 5L,
                             RewardType = "GoldBars"
                         });
+                });
+
+            modelBuilder.Entity("Api.Data.Models.AdMobSsvTransaction", b =>
+                {
+                    b.Property<string>("TransactionId")
+                        .HasMaxLength(255)
+                        .HasColumnType("character varying(255)");
+
+                    b.Property<DateTime>("AdCompletionTimestamp")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long?>("PlayerId")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateTime>("ProcessedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<decimal>("RewardAmount")
+                        .HasColumnType("numeric");
+
+                    b.Property<string>("RewardItem")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("character varying(100)");
+
+                    b.HasKey("TransactionId");
+
+                    b.HasIndex("PlayerId");
+
+                    b.ToTable("AdMobSsvTransactions");
                 });
 
             modelBuilder.Entity("Api.Data.Models.AgeVerificationStatus", b =>
@@ -1164,6 +1194,15 @@ namespace Api.Migrations
                             Description = "Special upgrades purchased with prestige currency.",
                             Name = "Prestige"
                         });
+                });
+
+            modelBuilder.Entity("Api.Data.Models.AdMobSsvTransaction", b =>
+                {
+                    b.HasOne("Api.Data.Models.Player", "Player")
+                        .WithMany()
+                        .HasForeignKey("PlayerId");
+
+                    b.Navigation("Player");
                 });
 
             modelBuilder.Entity("Api.Data.Models.ChatMessage", b =>

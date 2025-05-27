@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
+using Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -21,12 +22,10 @@ builder.Services.AddOpenApi();
 ///  Sets up Dependency Injection for the DbContext
 /// </summary>
 //Setup DbConnection
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-if (String.IsNullOrEmpty(connectionString))
-{
-    throw new InvalidOperationException("Connection string not found");
-}
-builder.Services.AddDbContext<AppDbContext>(options => options.UseNpgsql(connectionString));
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") ??
+                       throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseNpgsql(connectionString));
 
 // Add JWT Authentication
 var jwtSettings = builder.Configuration.GetSection("Jwt");
@@ -84,6 +83,13 @@ builder.Services.AddCors(options =>
                       });
 });
 // ************************
+
+// --- ADDED: Services for AdMob SSV ---
+builder.Services.AddMemoryCache(); // For caching public keys
+builder.Services.AddHttpClient("AdMobKeyClient"); // Named HttpClient for AdMobPublicKeyService
+builder.Services.AddScoped<IAdMobPublicKeyService, AdMobPublicKeyService>();
+builder.Services.AddScoped<IAdMobSsvVerifierService, AdMobSsvVerifierService>();
+// -------------------------------------
 
 var app = builder.Build();
 
