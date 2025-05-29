@@ -882,6 +882,7 @@ namespace Api.Controllers
             // ----------------------------------
 
             var player = await _context.Players
+                .Include(p => p.PlayerAgeVerification)
                 .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
             if (player == null)
