@@ -70,6 +70,11 @@ namespace Api.Controllers
             public required string ChatUsername { get; set; }
         }
 
+        public class VerifyPlayerAgeRequestDto
+        {
+            public DateTime DateOfBirth { get; set; }
+        }
+
         // --- Player Identification and Basic CRUD --- 
 
         // POST /api/players/identify
@@ -445,7 +450,7 @@ namespace Api.Controllers
             // <<< Log state of Minter 1 and instance count IMMEDIATELY BEFORE DTO MAPPING >>>
             _logger.LogInformation($"[GetGameState] PRE-DTO MAPPING: MemeMintPlayerData.MinterInstances count: {player.MemeMintPlayerData?.MinterInstances?.Count ?? -1}");
             var minter1ForDto = player.MemeMintPlayerData?.MinterInstances?.FirstOrDefault(m => m.ClientInstanceId == 1);
-            if (minter1ForDto != null) _logger.LogError($"[GetGameState] Minter 1 FOR DTO MAPPING: ID={minter1ForDto.ClientInstanceId}, EntityState={minter1ForDto.State}, TimeLeft={minter1ForDto.TimeRemainingSeconds}");
+            if (minter1ForDto != null) _logger.LogInformation($"[GetGameState] Minter 1 FOR DTO MAPPING: ID={minter1ForDto.ClientInstanceId}, EntityState={minter1ForDto.State}, TimeLeft={minter1ForDto.TimeRemainingSeconds}");
             else _logger.LogWarning("[GetGameState] Minter 1 NOT FOUND for DTO mapping.");
 
             var gameStateDto = new GameStateDto
@@ -471,9 +476,12 @@ namespace Api.Controllers
                 {
                     ChatUsername = player.PlayerChatInfo.ChatUsername
                 },
-                PlayerAgeVerification = new PlayerAgeVerificationDto
+                PlayerAgeVerification = new Api.Data.Dtos.PlayerAgeVerificationDto
                 {
-                    IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified"
+                    // IsVerified means a DoB was submitted and client-side platform check passed.
+                    IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified",
+                    DateOfBirth = player.PlayerAgeVerification?.DateOfBirth, // Populate DateOfBirth
+                    IsOver18 = CalculateIsOver18(player.PlayerAgeVerification?.DateOfBirth) // Calculate IsOver18
                 },
                 PlayerUpgrades = player.PlayerUpgrades?.Select(pu => new PlayerUpgradeDto
                 {
@@ -520,7 +528,9 @@ namespace Api.Controllers
             gameStateDto.PlayerSettings.NotificationsEnabled = player.PlayerSettings.NotificationsEnabled;
 
             gameStateDto.PlayerChatInfo.ChatUsername = player.PlayerChatInfo?.ChatUsername;
-            gameStateDto.PlayerAgeVerification.IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified";
+            ((Api.Data.Dtos.PlayerAgeVerificationDto)gameStateDto.PlayerAgeVerification).IsVerified = player.PlayerAgeVerification?.AgeVerificationStatus?.Status == "Verified";
+            ((Api.Data.Dtos.PlayerAgeVerificationDto)gameStateDto.PlayerAgeVerification).DateOfBirth = player.PlayerAgeVerification?.DateOfBirth;
+            ((Api.Data.Dtos.PlayerAgeVerificationDto)gameStateDto.PlayerAgeVerification).IsOver18 = CalculateIsOver18(player.PlayerAgeVerification?.DateOfBirth);
 
             return Ok(gameStateDto);
         }
@@ -868,7 +878,7 @@ namespace Api.Controllers
         // POST: api/players/{playerId}/verifyAge
         [HttpPost("{playerId:long}/verifyAge")]
         [Authorize] // Secure this endpoint
-        public async Task<IActionResult> VerifyPlayerAge(long playerId)
+        public async Task<IActionResult> VerifyPlayerAge(long playerId, [FromBody] VerifyPlayerAgeRequestDto requestDto) // Added requestDto
         {
             // --- ADD Authorization Check --- 
             var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
@@ -881,45 +891,61 @@ namespace Api.Controllers
             _logger.LogInformation("VerifyAge AuthCheck PASSED.");
             // ----------------------------------
 
+            // Validate DateOfBirth
+            if (requestDto.DateOfBirth == default(DateTime) || requestDto.DateOfBirth > DateTime.UtcNow)
+            {
+                _logger.LogWarning($"[VerifyPlayerAge] Invalid DateOfBirth provided for PlayerID {playerId}: {requestDto.DateOfBirth}");
+                return BadRequest("Invalid Date of Birth provided.");
+            }
+
             var player = await _context.Players
                 .Include(p => p.PlayerAgeVerification)
                 .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
             if (player == null)
             {
-                if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found.");
-                else return StatusCode(500, $"Player age verification record not found for player {playerId}.");
+                // This check is technically redundant if PlayerExists was called before, but good for safety.
+                if (!await PlayerExists(playerId)) return NotFound($"Player {playerId} not found."); 
+                // If player exists but the include failed to load PlayerAgeVerification (should not happen if correctly initialized)
+                _logger.LogError($"[VerifyPlayerAge] Player {playerId} found, but PlayerAgeVerification navigation property is unexpectedly null.");
+                return StatusCode(500, $"Player data integrity issue for player {playerId}.");
+            }
+
+            // Ensure PlayerAgeVerification entity exists (it should have been created during player identification)
+            if (player.PlayerAgeVerification == null)
+            {
+                _logger.LogWarning($"[VerifyPlayerAge] PlayerAgeVerification is null for PlayerID {playerId}. Initializing a new one.");
+                player.PlayerAgeVerification = new PlayerAgeVerification { PlayerId = playerId, AgeVerificationStatusId = 1 }; // Default to Not Verified
+                _context.PlayerAgeVerifications.Add(player.PlayerAgeVerification); // Explicitly add if creating new
             }
 
             // Find the ID for the "Verified" status (assuming it exists from seeding)
+            // This status now means "DoB submitted and client-side platform minimum age met"
             long verifiedStatusId = await _context.AgeVerificationStatuses
                                             .Where(s => s.Status == "Verified")
                                             .Select(s => s.Id)
                                             .FirstOrDefaultAsync();
 
             if (verifiedStatusId == 0) {
-                Console.WriteLine($"ERROR verifying age for player {playerId}: 'Verified' status not found in DB.");
+                _logger.LogError($"ERROR verifying age for player {playerId}: 'Verified' status not found in DB.");
                 return StatusCode(500, "Server configuration error: Cannot find 'Verified' status.");
             }
 
-            if (player.PlayerAgeVerification != null) // Ensure PlayerAgeVerification exists
-            {
-                player.PlayerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
-                player.PlayerAgeVerification.VerifiedAt = DateTime.UtcNow;
-            }
-            else
-            {
-                _logger.LogError($"[VerifyPlayerAge] PlayerAgeVerification is null for PlayerID {playerId}. Cannot set as verified.");
-                return StatusCode(500, "Player age verification record not found.");
-            }
+            player.PlayerAgeVerification.AgeVerificationStatusId = verifiedStatusId;
+            player.PlayerAgeVerification.VerifiedAt = DateTime.UtcNow;
+            player.PlayerAgeVerification.DateOfBirth = requestDto.DateOfBirth; // Save the Date of Birth
+            player.PlayerAgeVerification.VerificationMethod = "ClientDOBInput"; // Indicate method
+            player.PlayerAgeVerification.LastVerificationAttempt = DateTime.UtcNow;
+            player.PlayerAgeVerification.VerificationAttemptCount = player.PlayerAgeVerification.VerificationAttemptCount + 1;
 
             try
             {
                 await _context.SaveChangesAsync();
+                 _logger.LogInformation($"[VerifyPlayerAge] PlayerID {playerId} successfully saved DateOfBirth: {requestDto.DateOfBirth:yyyy-MM-dd} and set status to Verified.");
             }
             catch (Exception ex)
             {
-                 Console.WriteLine($"ERROR saving age verification for player {playerId}: {ex.Message}");
+                 _logger.LogError(ex, $"ERROR saving age verification for player {playerId} with DOB {requestDto.DateOfBirth:yyyy-MM-dd}.");
                  return StatusCode(500, "An error occurred saving age verification.");
             }
 
@@ -1257,6 +1283,18 @@ namespace Api.Controllers
                     }).ToList()
                 }
             });
+        }
+
+        // Helper method to calculate if user is over 18
+        private bool CalculateIsOver18(DateTime? dateOfBirth)
+        {
+            if (!dateOfBirth.HasValue)
+            {
+                return false;
+            }
+            DateTime today = DateTime.UtcNow.Date;
+            DateTime eighteenYearsAgo = today.AddYears(-18);
+            return dateOfBirth.Value.Date <= eighteenYearsAgo;
         }
 
     }

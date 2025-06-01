@@ -46,7 +46,9 @@ namespace Api.Data.Dtos
 
     public class PlayerAgeVerificationDto
     {
-        public bool IsVerified { get; set; }
+        public bool IsVerified { get; set; } // This will now mean "Has a DoB been submitted and client-side platform minimum met?"
+        public DateTime? DateOfBirth { get; set; } // The actual DoB, null if not provided
+        public bool IsOver18 { get; set; }      // Calculated on server: is the user 18 or older?
         // Optional: Include status ID/text or verification timestamp if needed by client
         // public long AgeVerificationStatusId { get; set; }
         // public DateTime? VerifiedAtTimestamp { get; set; }

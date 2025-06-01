@@ -35,12 +35,12 @@ namespace Api.Data.Context
         public DbSet<AgeVerificationStatus> AgeVerificationStatuses { get; set; } = null!;
         public DbSet<ChatMessage> ChatMessages { get; set; } = null!;
 
-        // ADD DbSet for AdMob SSV Transactions , still working on getting valid callback even tho it passed the callback verification on the unit itself... curious 
-        public DbSet<AdMobSsvTransaction> AdMobSsvTransactions { get; set; } = null!;
-
         // ADD NEW DBSETS for Meme Mint Feature
         public DbSet<PlayerMemeMintPlayerData> PlayerMemeMintDatas { get; set; } = null!;
         public DbSet<MinterInstance> MinterInstances { get; set; } = null!;
+
+        // ADD DbSet for AdMob SSV Transactions
+        public DbSet<AdMobSsvTransaction> AdMobSsvTransactions { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {

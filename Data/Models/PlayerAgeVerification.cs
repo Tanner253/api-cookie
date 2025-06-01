@@ -16,6 +16,8 @@ namespace Api.Data.Models
 
         public string? VerificationMethod { get; set; }
 
+        public DateTime? DateOfBirth { get; set; }
+
         public DateTime? LastVerificationAttempt { get; set; }
 
         public int VerificationAttemptCount { get; set; }

@@ -19,11 +19,12 @@ namespace Api.Data.Models
 
         [Required]
         public int SharedMintProgress { get; set; } = 0;
-        
+
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
         // Navigation property for the minter instances owned by this player's meme mint data
-        public virtual ICollection<MinterInstance> MinterInstances { get; set; } = new List<MinterInstance>();
+        public virtual ICollection<MinterInstance> MinterInstances { get; set; } =
+            new List<MinterInstance>();
     }
-} 
+}
