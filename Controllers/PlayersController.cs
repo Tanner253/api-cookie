@@ -504,12 +504,23 @@ namespace Api.Controllers
                     PlayerGCMPMPoints = player.MemeMintPlayerData?.PlayerGCMPMPoints ?? 0,
                     SharedMintProgress = player.MemeMintPlayerData?.SharedMintProgress ?? 0,
                     MinterInstances = player.MemeMintPlayerData?.MinterInstances? // Null-conditional access
-                        .Select(mi => new MinterInstanceDataDto
+                        .Select(mi => 
                         {
-                            InstanceId = mi.ClientInstanceId,
-                            State = (MinterStateDto)mi.State,
-                            TimeRemainingSeconds = mi.TimeRemainingSeconds,
-                            IsUnlocked = mi.IsUnlocked
+                            float timeRemaining = mi.TimeRemainingSeconds; // Default to stored value
+                            if (mi.State == MinterState.MintingInProgress && mi.LastCycleStartTimeUTC.HasValue)
+                            {
+                                float totalCycleDuration = GetBaseMintingTimeForInstance(mi.ClientInstanceId);
+                                float elapsedSeconds = (float)(DateTime.UtcNow - mi.LastCycleStartTimeUTC.Value).TotalSeconds;
+                                timeRemaining = Math.Max(0, totalCycleDuration - elapsedSeconds);
+                            }
+
+                            return new MinterInstanceDataDto
+                            {
+                                InstanceId = mi.ClientInstanceId,
+                                State = (MinterStateDto)mi.State,
+                                TimeRemainingSeconds = timeRemaining, // Use the dynamically calculated value
+                                IsUnlocked = mi.IsUnlocked
+                            };
                         }).ToList() ?? new List<MinterInstanceDataDto>() // Default to empty list if MinterInstances is null
                 }
             };
@@ -551,58 +562,37 @@ namespace Api.Controllers
 
             foreach (var minter in player.MemeMintPlayerData.MinterInstances.ToList())
             {
-                if (minter.State == MinterState.MintingInProgress && minter.IsUnlocked)
+                if (minter.State == MinterState.MintingInProgress && minter.IsUnlocked && minter.LastCycleStartTimeUTC.HasValue)
                 {
-                    float elapsedSinceLastStart = 0f;
-                    if (minter.LastCycleStartTimeUTC != null)
-                    {
-                        elapsedSinceLastStart = (float)(currentTimeUtc - minter.LastCycleStartTimeUTC.Value).TotalSeconds;
-                    }
+                    // --- REVISED: Server-Authoritative Time Calculation ---
+                    float totalCycleDuration = GetBaseMintingTimeForInstance(minter.ClientInstanceId); // Get the full duration for this minter.
+                    TimeSpan timeSinceStart = DateTime.UtcNow - minter.LastCycleStartTimeUTC.Value;
+                    float newTimeRemaining = totalCycleDuration - (float)timeSinceStart.TotalSeconds;
 
-                    // If an explicit elapsedSecondsOverride is provided (e.g., for offline calculation based on LastSaveTime),
-                    // use that instead of calculating from LastCycleStartTimeUTC for this specific pass.
-                    // This handles the scenario where LastCycleStartTimeUTC might be very old due to long offline time.
-                    float durationToProcess = elapsedSecondsOverride ?? elapsedSinceLastStart;
-                    
-                    // How much time was *actually* remaining in the cycle when it was last known to be running.
-                    // If LastCycleStartTimeUTC is recent, TimeRemainingSeconds should be accurate.
-                    // If it's an old LastCycleStartTimeUTC, TimeRemainingSeconds might be the full cycle time.
-                    float timeActuallyLeftInCycle = minter.TimeRemainingSeconds;
-                    
-                    if (durationToProcess >= timeActuallyLeftInCycle && timeActuallyLeftInCycle > 0) // Cycle completed
+                    if (newTimeRemaining <= 0) // Cycle has completed
                     {
-                        int cyclesCompletedThisPass = 0;
-                        if (isOfflineCalculation) // For offline, calculate all possible completions
+                        if (minter.State != MinterState.CycleCompleted) // Only trigger change if it wasn't already marked
                         {
-                            cyclesCompletedThisPass = 1; // The one that was running
-                            float remainingOfflineTimeToConsiderForMoreCycles = durationToProcess - timeActuallyLeftInCycle;
-                            // As per your requirement, minters don't auto-restart offline.
-                            // So, we only complete the one cycle that was in progress.
+                            minter.State = MinterState.CycleCompleted;
                             minter.TimeRemainingSeconds = 0;
-                        }
-                        else // For online /process call, likely means the current cycle just finished
-                        {
-                            cyclesCompletedThisPass = 1;
-                            minter.TimeRemainingSeconds = 0;
-                        }
-
-                        if (cyclesCompletedThisPass > 0)
-                        {
-                            _logger.LogInformation($"[ProcessInternal] Minter {minter.ClientInstanceId} PRE-STATE-CHANGE: Current State={minter.State}");
-                            minter.State = MinterState.CycleCompleted; 
-                            minter.LastCycleStartTimeUTC = null; 
+                            minter.LastCycleStartTimeUTC = null; // Clear start time as the cycle is done
                             anyChangeMade = true;
-                            _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} cycle completed. NEW State: {minter.State}. (Offline: {isOfflineCalculation})");
+                            _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} cycle completed. NEW State: {minter.State}.");
                         }
                     }
-                    else if (durationToProcess > 0) // Partially progressed but not finished
+                    else // Cycle is still in progress
                     {
-                        float oldTimeRemaining = minter.TimeRemainingSeconds;
-                        minter.TimeRemainingSeconds = Math.Max(0, timeActuallyLeftInCycle - durationToProcess);
-                        anyChangeMade = true;
-                        _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} timer updated. OldTime: {oldTimeRemaining:F1}s, NewTime: {minter.TimeRemainingSeconds:F1}s. (Offline: {isOfflineCalculation})");
+                        // Check if the newly calculated time is different from the stored one.
+                        // Use a small tolerance to avoid unnecessary database writes for tiny floating point differences.
+                        if (Math.Abs(minter.TimeRemainingSeconds - newTimeRemaining) > 1.0f)
+                        {
+                            minter.TimeRemainingSeconds = newTimeRemaining;
+                            anyChangeMade = true;
+                            _logger.LogInformation($"[ProcessInternal] Player {player.PlayerId}, Minter {minter.ClientInstanceId} timer updated. NewTime: {minter.TimeRemainingSeconds:F1}s.");
+                        }
                     }
-                    minter.UpdatedAt = currentTimeUtc;
+                    minter.UpdatedAt = DateTime.UtcNow;
+                    // --- END REVISED ---
                 }
             }
 
@@ -878,7 +868,7 @@ namespace Api.Controllers
         // POST: api/players/{playerId}/verifyAge
         [HttpPost("{playerId:long}/verifyAge")]
         [Authorize] // Secure this endpoint
-        public async Task<IActionResult> VerifyPlayerAge(long playerId, [FromBody] VerifyPlayerAgeRequestDto requestDto) // Added requestDto
+        public async Task<ActionResult<PlayerAgeVerificationDto>> VerifyPlayerAge(long playerId, [FromBody] VerifyPlayerAgeRequestDto requestDto) // Added requestDto
         {
             // --- ADD Authorization Check --- 
             var requestingPlayerId = User.FindFirstValue(ClaimTypes.NameIdentifier); 
@@ -900,6 +890,7 @@ namespace Api.Controllers
 
             var player = await _context.Players
                 .Include(p => p.PlayerAgeVerification)
+                .ThenInclude(pav => pav.AgeVerificationStatus)
                 .FirstOrDefaultAsync(p => p.PlayerId == playerId);
 
             if (player == null)
@@ -948,8 +939,23 @@ namespace Api.Controllers
                  _logger.LogError(ex, $"ERROR saving age verification for player {playerId} with DOB {requestDto.DateOfBirth:yyyy-MM-dd}.");
                  return StatusCode(500, "An error occurred saving age verification.");
             }
+            
+            // After saving, fetch the status text if it wasn't loaded or to be safe
+            var status = player.PlayerAgeVerification.AgeVerificationStatus?.Status ?? 
+             await _context.AgeVerificationStatuses
+                           .Where(s => s.Id == player.PlayerAgeVerification.AgeVerificationStatusId)
+                           .Select(s => s.Status)
+                           .FirstOrDefaultAsync() ?? "Unknown";
 
-            return Ok(); // Return 200 OK to indicate success
+
+            var responseDto = new PlayerAgeVerificationDto
+            {
+                IsVerified = status == "Verified",
+                DateOfBirth = player.PlayerAgeVerification.DateOfBirth,
+                IsOver18 = CalculateIsOver18(player.PlayerAgeVerification.DateOfBirth)
+            };
+
+            return Ok(responseDto);
         }
 
         // --- Mute List Endpoints ---
