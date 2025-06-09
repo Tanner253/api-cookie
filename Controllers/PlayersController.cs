@@ -53,6 +53,8 @@ namespace Api.Controllers
         {
             public required PlayerDto Player { get; set; }
             public required string AccessToken { get; set; }
+            public bool IsNewPlayer { get; set; }
+            public GameStateDto? InitialGameState { get; set; }
         }
 
         public class RefreshTokenRequestDto
@@ -115,6 +117,9 @@ namespace Api.Controllers
                 else
                 {
                     // 3. Not found by either ID, create a new player
+                    var random = new System.Random();
+                    var defaultUsername = $"Player{random.Next(100, 10000)}";
+
                     player = new Player
                     {
                         DeviceId = request.DeviceId,
@@ -124,7 +129,7 @@ namespace Api.Controllers
                         // Initialize required related entities with default values
                         PlayerState = new PlayerState(),
                         PlayerSettings = new PlayerSettings(),
-                        PlayerChatInfo = new PlayerChatInfo { ChatUsername = null, UpdatedAt = DateTime.UtcNow },
+                        PlayerChatInfo = new PlayerChatInfo { ChatUsername = defaultUsername, UpdatedAt = DateTime.UtcNow },
                         PlayerAgeVerification = new PlayerAgeVerification { AgeVerificationStatusId = 1, VerificationAttemptCount = 0 }
                     };
                     _context.Players.Add(player);
@@ -167,10 +172,38 @@ namespace Api.Controllers
             Response.Cookies.Append("refreshToken", refreshToken, cookieOptions);
             // -----------------------------------------------------
 
+            GameStateDto? initialGameState = null;
+            if (createdNewPlayer)
+            {
+                // If a new player was created, we can construct a default game state
+                // to send back immediately. This saves the client from making a second call.
+                initialGameState = new GameStateDto
+                {
+                    PlayerState = new PlayerStateDto(),
+                    PlayerSettings = new PlayerSettingsDto(),
+                    PlayerChatInfo = new PlayerChatInfoDto { ChatUsername = player.PlayerChatInfo.ChatUsername },
+                    PlayerAgeVerification = new PlayerAgeVerificationDto { IsVerified = false, DateOfBirth = null, IsOver18 = false },
+                    PlayerUpgrades = new List<PlayerUpgradeDto>(),
+                    PlayerAchievements = new List<PlayerAchievementDto>(),
+                    PlayerStatistics = new List<PlayerStatisticDto>(),
+                    MemeMintData = new MemeMintPlayerDataDto
+                    {
+                        MinterInstances = new List<MinterInstanceDataDto>
+                        {
+                            new MinterInstanceDataDto { InstanceId = 1, IsUnlocked = true, State = MinterStateDto.Idle },
+                            new MinterInstanceDataDto { InstanceId = 2, IsUnlocked = false, State = MinterStateDto.Idle },
+                            new MinterInstanceDataDto { InstanceId = 3, IsUnlocked = false, State = MinterStateDto.Idle }
+                        }
+                    }
+                };
+            }
+
             var responseDto = new IdentifyPlayerResponseDto
             {
                 Player = playerDto,
-                AccessToken = accessToken // Only return the access token in the body
+                AccessToken = accessToken, // Only return the access token in the body
+                IsNewPlayer = createdNewPlayer,
+                InitialGameState = initialGameState
             };
 
             if (createdNewPlayer)
